@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { API_BASE } from "./apiBase";
 import {
   Box,
   Paper,
@@ -40,7 +41,7 @@ export default function ProfileManagement({ user, onUserUpdated, onRequireRelogi
 
   const fetchProfile = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/me");
+      const res = await axios.get(API_BASE + "/me");
       const nextProfile = {
         fullName: res.data.fullName || "",
         email: res.data.email || "",
@@ -56,7 +57,7 @@ export default function ProfileManagement({ user, onUserUpdated, onRequireRelogi
 
   const fetchReport = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/me/report");
+      const res = await axios.get(API_BASE + "/me/report");
       setReport(res.data);
     } catch (error) {
       console.error("fetchReport failed", error);
@@ -75,7 +76,7 @@ export default function ProfileManagement({ user, onUserUpdated, onRequireRelogi
         ...profile,
         avatarUrl: profile.avatarUrl ? profile.avatarUrl : null,
       };
-      const res = await axios.put("http://localhost:4000/me", payload);
+      const res = await axios.put(API_BASE + "/me", payload);
       onUserUpdated?.({
         ...user,
         fullName: res.data.fullName || "",
@@ -96,7 +97,7 @@ export default function ProfileManagement({ user, onUserUpdated, onRequireRelogi
     try {
       const formData = new FormData();
       formData.append("avatar", file);
-      const res = await axios.post("http://localhost:4000/me/avatar-upload", formData, {
+      const res = await axios.post(API_BASE + "/me/avatar-upload", formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
       const nextAvatarUrl = res.data?.avatarUrl || "";
@@ -127,7 +128,7 @@ export default function ProfileManagement({ user, onUserUpdated, onRequireRelogi
 
     setLoading(true);
     try {
-      await axios.put("http://localhost:4000/me/password", {
+      await axios.put(API_BASE + "/me/password", {
         currentPassword: passwordForm.currentPassword,
         newPassword: passwordForm.newPassword,
       });

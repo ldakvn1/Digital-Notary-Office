@@ -1,3 +1,4 @@
+import { API_BASE } from "./apiBase";
 import {
   Dialog,
   DialogTitle,
@@ -172,7 +173,7 @@ export default function CaseDetailModal({
       return;
     }
     try {
-      const res = await axios.get("http://localhost:4000/users");
+      const res = await axios.get(API_BASE + "/users");
       const allUsers = Array.isArray(res.data) ? res.data : [];
       const assignableUsers = allUsers.filter((item) => {
         const roleKey = normalizeRoleKey(item?.role);
@@ -189,7 +190,7 @@ export default function CaseDetailModal({
 
   const fetchTemplates = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/templates");
+      const res = await axios.get(API_BASE + "/templates");
       setTemplates(
         Array.isArray(res.data)
           ? res.data.filter((item) => item.isActive && String(item.status || "").toUpperCase() === "APPROVED")
@@ -205,7 +206,7 @@ export default function CaseDetailModal({
     try {
       const caseId = caseIdArg || activeCase.id || caseData?.id;
       if (!caseId) return;
-      const res = await axios.get(`http://localhost:4000/cases/${caseId}`);
+      const res = await axios.get(`${API_BASE}/cases/${caseId}`);
       setActiveCase(res.data);
       setDeadline(
         res.data.deadline ? new Date(res.data.deadline).toISOString().slice(0, 10) : ""
@@ -227,7 +228,7 @@ export default function CaseDetailModal({
 
   const fetchRiskWarnings = async (caseId) => {
     try {
-      const res = await axios.get(`http://localhost:4000/cases/${caseId}/risk-warnings`);
+      const res = await axios.get(`${API_BASE}/cases/${caseId}/risk-warnings`);
       setRiskWarnings(res.data?.warnings || []);
     } catch (err) {
       console.error("Error fetching risk warnings:", err);
@@ -237,7 +238,7 @@ export default function CaseDetailModal({
 
   const fetchCopyRequests = async (caseId) => {
     try {
-      const res = await axios.get(`http://localhost:4000/cases/${caseId}/copy-requests`);
+      const res = await axios.get(`${API_BASE}/cases/${caseId}/copy-requests`);
       setCopyRequests(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error("Error fetching copy requests:", err);
@@ -246,7 +247,7 @@ export default function CaseDetailModal({
   };
   const fetchReceipts = async (caseId) => {
     try {
-      const res = await axios.get(`http://localhost:4000/cases/${caseId}/receipts`);
+      const res = await axios.get(`${API_BASE}/cases/${caseId}/receipts`);
       setReceipts(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error("Error fetching receipts:", err);
@@ -257,7 +258,7 @@ export default function CaseDetailModal({
   const startInheritancePosting = async () => {
     try {
       const res = await axios.post(
-        `http://localhost:4000/cases/${activeCase.id || caseData.id}/inheritance/start-posting`,
+        `${API_BASE}/cases/${activeCase.id || caseData.id}/inheritance/start-posting`,
         { notes: inheritanceNotes || "" }
       );
       setActiveCase(res.data);
@@ -275,7 +276,7 @@ export default function CaseDetailModal({
     }
     try {
       const res = await axios.post(
-        `http://localhost:4000/cases/${activeCase.id || caseData.id}/inheritance/finalize-posting`,
+        `${API_BASE}/cases/${activeCase.id || caseData.id}/inheritance/finalize-posting`,
         { result: inheritanceResult, notes: inheritanceNotes || "" }
       );
       setActiveCase(res.data);
@@ -293,7 +294,7 @@ export default function CaseDetailModal({
     }
     try {
       await axios.post(
-        `http://localhost:4000/cases/${activeCase.id || caseData.id}/copy-requests`,
+        `${API_BASE}/cases/${activeCase.id || caseData.id}/copy-requests`,
         copyForm
       );
       setCopyForm({
@@ -313,7 +314,7 @@ export default function CaseDetailModal({
 
   const approveCopyRequest = async (id) => {
     try {
-      await axios.post(`http://localhost:4000/copy-requests/${id}/approve`, {});
+      await axios.post(`${API_BASE}/copy-requests/${id}/approve`, {});
       await fetchCopyRequests(activeCase.id || caseData.id);
       toastApi.success(t("copyRequest.approveSuccess"));
     } catch (err) {
@@ -328,7 +329,7 @@ export default function CaseDetailModal({
       return;
     }
     try {
-      await axios.post(`http://localhost:4000/copy-requests/${id}/reject`, {
+      await axios.post(`${API_BASE}/copy-requests/${id}/reject`, {
         rejectionReason: copyRejection.reason,
       });
       setCopyRejection({ id: null, reason: "" });
@@ -342,7 +343,7 @@ export default function CaseDetailModal({
 
   const issueCopyRequest = async (id) => {
     try {
-      await axios.post(`http://localhost:4000/copy-requests/${id}/issue`, {});
+      await axios.post(`${API_BASE}/copy-requests/${id}/issue`, {});
       await fetchCopyRequests(activeCase.id || caseData.id);
       toastApi.success(t("copyRequest.issueSuccess"));
     } catch (err) {
@@ -392,7 +393,7 @@ export default function CaseDetailModal({
     }
     setLoading(true);
     try {
-      const res = await axios.put(`http://localhost:4000/cases/${activeCase.id || caseData.id}/fee`, {
+      const res = await axios.put(`${API_BASE}/cases/${activeCase.id || caseData.id}/fee`, {
         feeAmount: Number(feeAmount || 0),
         paymentMethod,
       });
@@ -409,7 +410,7 @@ export default function CaseDetailModal({
   const issueNotaryRecord = async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/issue`);
+      const res = await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/issue`);
       setActiveCase(res.data);
       toastApi.success("Đã phát hành số công chứng và khóa hồ sơ");
     } catch (err) {
@@ -428,7 +429,7 @@ export default function CaseDetailModal({
     }
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/cases/${activeCase.id}/financial-reset`, {
+      const res = await axios.post(`${API_BASE}/cases/${activeCase.id}/financial-reset`, {
         reason: financialResetReason.trim(),
       });
       setActiveCase(res.data);
@@ -447,7 +448,7 @@ export default function CaseDetailModal({
   const unlockCase = async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/unlock`);
+      const res = await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/unlock`);
       setActiveCase(res.data);
       toastApi.success("Đã mở khóa hồ sơ");
     } catch (err) {
@@ -465,7 +466,7 @@ export default function CaseDetailModal({
     }
     setLoading(true);
     try {
-      const { data } = await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/generate-document`, {
+      const { data } = await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/generate-document`, {
         templateId: Number(selectedTemplateId),
       });
       await fetchCase();
@@ -487,7 +488,7 @@ export default function CaseDetailModal({
   const signCase = async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/sign`);
+      const res = await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/sign`);
       setActiveCase(res.data);
       toastApi.success("Đã ký duyệt hồ sơ");
     } catch (err) {
@@ -501,7 +502,7 @@ export default function CaseDetailModal({
   const sealCase = async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/seal`);
+      const res = await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/seal`);
       setActiveCase(res.data);
       toastApi.success("Đã đóng dấu hồ sơ");
     } catch (err) {
@@ -515,7 +516,7 @@ export default function CaseDetailModal({
   const releaseCase = async () => {
     setLoading(true);
     try {
-      await axios.post(`http://localhost:4000/cases/${activeCase.id || caseData.id}/release`, {
+      await axios.post(`${API_BASE}/cases/${activeCase.id || caseData.id}/release`, {
         templateId: selectedTemplateId ? Number(selectedTemplateId) : undefined,
       });
       await fetchCase();
@@ -541,7 +542,7 @@ export default function CaseDetailModal({
     setLoading(true);
     try {
       const res = await axios.post(
-        `http://localhost:4000/cases/${activeCase.id || caseData.id}/upload-signed-pdf`,
+        `${API_BASE}/cases/${activeCase.id || caseData.id}/upload-signed-pdf`,
         formData
       );
       setActiveCase(res.data.case);
@@ -560,7 +561,7 @@ export default function CaseDetailModal({
     if (!activeCase?.id) return;
     setLoading(true);
     try {
-      await axios.delete(`http://localhost:4000/cases/${activeCase.id}`, {
+      await axios.delete(`${API_BASE}/cases/${activeCase.id}`, {
         data: { reason: deleteReason || "Administrative deletion" },
       });
       toastApi.success("Đã hủy/xóa mềm hồ sơ");
@@ -578,7 +579,7 @@ export default function CaseDetailModal({
     if (!activeCase?.id) return;
     setLoading(true);
     try {
-      await axios.post(`http://localhost:4000/cases/${activeCase.id}/restore`);
+      await axios.post(`${API_BASE}/cases/${activeCase.id}/restore`);
       toastApi.success("Đã khôi phục hồ sơ");
       onCaseDeleted?.();
     } catch (err) {
@@ -593,7 +594,7 @@ export default function CaseDetailModal({
     setConfirmAction({ open: false, type: "", payload: null });
     setLoading(true);
     try {
-      const res = await axios.put(`http://localhost:4000/cases/${activeCase.id || caseData.id}/assign`, {
+      const res = await axios.put(`${API_BASE}/cases/${activeCase.id || caseData.id}/assign`, {
         assignedTo: selectedUser,
       });
       setActiveCase(res.data);
@@ -615,7 +616,7 @@ export default function CaseDetailModal({
 
     setLoading(true);
     try {
-      const res = await axios.put(`http://localhost:4000/cases/${activeCase.id || caseData.id}/deadline`, {
+      const res = await axios.put(`${API_BASE}/cases/${activeCase.id || caseData.id}/deadline`, {
         deadline,
       });
       setActiveCase(res.data);
@@ -645,7 +646,7 @@ export default function CaseDetailModal({
       setProgress(0);
 
       const response = await axios.post(
-        `http://localhost:4000/upload/${activeCase.id || caseData?.id}`,
+        `${API_BASE}/upload/${activeCase.id || caseData?.id}`,
         formData,
         {
           onUploadProgress: (event) => {
@@ -684,7 +685,7 @@ export default function CaseDetailModal({
       return;
     }
     try {
-      const response = await axios.get(`http://localhost:4000/files/${fileItem.id}/download`, {
+      const response = await axios.get(`${API_BASE}/files/${fileItem.id}/download`, {
         responseType: "blob",
       });
       const contentDisposition = String(response.headers?.["content-disposition"] || "");
@@ -716,7 +717,7 @@ export default function CaseDetailModal({
     setConfirmAction({ open: false, type: "", payload: null });
     try {
       setLoading(true);
-      await axios.delete(`http://localhost:4000/cases/${activeCase.id || caseData?.id}/files/${fileIndex}`);
+      await axios.delete(`${API_BASE}/cases/${activeCase.id || caseData?.id}/files/${fileIndex}`);
       await fetchCase();
       toastApi.success(t("common.delete"));
     } catch (err) {

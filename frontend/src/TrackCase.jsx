@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Alert,
@@ -33,7 +34,7 @@ export default function TrackCase({ initialCode = "" }) {
     setError("");
     setLoading(true);
     try {
-      const res = await axios.post(`http://localhost:4000/public/track/${code.trim()}`, {
+      const res = await axios.post(`${API_BASE}/public/track/${code.trim()}`, {
         otp: otp.trim(),
       });
       setResult(res.data);

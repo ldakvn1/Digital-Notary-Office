@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Box,
@@ -51,7 +52,7 @@ export default function TranslatorManagement() {
 
   const fetchList = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/translator-collaborators");
+      const res = await axios.get(API_BASE + "/translator-collaborators");
       setList(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -71,7 +72,7 @@ export default function TranslatorManagement() {
     setLoading(true);
     try {
       if (form.id) {
-        await axios.put(`http://localhost:4000/translator-collaborators/${form.id}`, {
+        await axios.put(`${API_BASE}/translator-collaborators/${form.id}`, {
           fullName: form.fullName,
           idNumber: form.idNumber,
           languages: form.languages,
@@ -79,7 +80,7 @@ export default function TranslatorManagement() {
           isActive: form.isActive,
         });
       } else {
-        await axios.post("http://localhost:4000/translator-collaborators", {
+        await axios.post(API_BASE + "/translator-collaborators", {
           fullName: form.fullName,
           idNumber: form.idNumber,
           languages: form.languages,
@@ -100,7 +101,7 @@ export default function TranslatorManagement() {
 
   const remove = async (id) => {
     try {
-      await axios.delete(`http://localhost:4000/translator-collaborators/${id}`);
+      await axios.delete(`${API_BASE}/translator-collaborators/${id}`);
       await fetchList();
       toastApi.success(t("translator.deleteSuccess"));
     } catch (err) {

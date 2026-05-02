@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   AppBar,
@@ -150,7 +151,7 @@ export default function CreateCaseDialog({ open, onClose, customers, onCreated, 
     formData.append("file", cccdFile);
     setOcrLoading(true);
     try {
-      const res = await axios.post("http://localhost:4000/ocr/cccd", formData);
+      const res = await axios.post(API_BASE + "/ocr/cccd", formData);
       const extracted = res.data?.data || {};
       if (extracted.fullName) setName(extracted.fullName);
       if (extracted.idNumber) setIdNumber(extracted.idNumber);
@@ -193,7 +194,7 @@ export default function CreateCaseDialog({ open, onClose, customers, onCreated, 
 
     setLoading(true);
     try {
-      const res = await axios.post("http://localhost:4000/cases", {
+      const res = await axios.post(API_BASE + "/cases", {
         customerId: selectedCustomerId !== "__new__" ? selectedCustomerId : undefined,
         customerName: name.trim(),
         phone: phone.trim(),
@@ -253,7 +254,7 @@ export default function CreateCaseDialog({ open, onClose, customers, onCreated, 
     setLoading(true);
     setUploadProgress(0);
     try {
-      await axios.post(`http://localhost:4000/upload/${createdCaseId}`, formData, {
+      await axios.post(`${API_BASE}/upload/${createdCaseId}`, formData, {
         onUploadProgress: (event) => {
           const percent = Math.round((event.loaded * 100) / (event.total || 1));
           setUploadProgress(percent);

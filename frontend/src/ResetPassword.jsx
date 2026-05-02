@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import { Box, Button, LinearProgress, Paper, TextField, Tooltip, Typography } from "@mui/material";
 import { ToastHost, useToastQueue } from "./toast";
@@ -30,7 +31,7 @@ export default function ResetPassword({ token = "" }) {
     }
     setLoading(true);
     try {
-      const res = await axios.post("http://localhost:4000/auth/reset-password", {
+      const res = await axios.post(API_BASE + "/auth/reset-password", {
         token,
         newPassword,
       });

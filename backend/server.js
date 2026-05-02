@@ -49,6 +49,13 @@ const CHAT_STATUS = {
 const CHAT_STATUS_VALUES = new Set(Object.values(CHAT_STATUS));
 let mailTransporter = null;
 
+function publicApiOrigin(req) {
+  const host = req.get("host") || "localhost:4000";
+  const rawProto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const proto = typeof rawProto === "string" ? rawProto.split(",")[0].trim() : "http";
+  return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
 app.set("trust proxy", 1);
 app.use(
   helmet({
@@ -58,11 +65,18 @@ app.use(
 app.use(
   cors({
     origin: (origin, callback) => {
-      const explicitAllowed = new Set([process.env.ALLOWED_ORIGIN || "http://localhost:5173"]);
+      const explicitAllowed = new Set(
+        [process.env.ALLOWED_ORIGIN || "http://localhost:5173"].filter(Boolean)
+      );
+      const o = origin || "";
       const isLocalDevOrigin =
-        /^http:\/\/localhost:\d+$/i.test(origin || "") ||
-        /^http:\/\/127\.0\.0\.1:\d+$/i.test(origin || "");
-      if (!origin || explicitAllowed.has(origin) || isLocalDevOrigin) {
+        /^http:\/\/localhost:\d+$/i.test(o) ||
+        /^http:\/\/127\.0\.0\.1:\d+$/i.test(o);
+      const isPrivateLanHttpOrigin =
+        /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:\d+$/i.test(o) ||
+        /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/i.test(o) ||
+        /^http:\/\/172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}:\d+$/i.test(o);
+      if (!origin || explicitAllowed.has(origin) || isLocalDevOrigin || isPrivateLanHttpOrigin) {
         return callback(null, true);
       }
       return callback(new Error("CORS blocked for this origin"));
@@ -2532,7 +2546,7 @@ app.post(
       const toPath = path.join(__dirname, "uploads", filename);
       fs.renameSync(fromPath, toPath);
       return res.json({
-        avatarUrl: `http://localhost:4000/avatars/${filename}`,
+        avatarUrl: `${publicApiOrigin(req)}/avatars/${filename}`,
       });
     } catch (error) {
       console.error(error);
@@ -2702,7 +2716,7 @@ app.post(
       const toPath = path.join(__dirname, "uploads", filename);
       fs.renameSync(fromPath, toPath);
       return res.json({
-        avatarUrl: `http://localhost:4000/avatars/${filename}`,
+        avatarUrl: `${publicApiOrigin(_req)}/avatars/${filename}`,
       });
     } catch (error) {
       console.error(error);
@@ -3143,7 +3157,7 @@ app.post(
       fs.writeFileSync(targetPath, renderedDocx);
       return res.json({
         filename: storedFilename,
-        url: `http://localhost:4000/uploads/${storedFilename}`,
+        url: `${publicApiOrigin(req)}/uploads/${storedFilename}`,
         mergedHtml,
       });
     } catch (error) {
@@ -4781,7 +4795,7 @@ app.post(
         const filePath = path.join(__dirname, "uploads", storedFilename);
         fs.writeFileSync(filePath, rendered, "utf8");
       }
-      const fileUrl = `http://localhost:4000/uploads/${storedFilename}`;
+      const fileUrl = `${publicApiOrigin(req)}/uploads/${storedFilename}`;
       const generatedFile = await prisma.file.create({
         data: {
           caseId: caseItem.id,
@@ -4939,7 +4953,7 @@ app.post(
         "-----------------------------",
         sourceText,
       ]);
-      const fileUrl = `http://localhost:4000/uploads/${pdfStoredFilename}`;
+      const fileUrl = `${publicApiOrigin(req)}/uploads/${pdfStoredFilename}`;
       const releasedFile = await prisma.file.create({
         data: {
           caseId: caseItem.id,
@@ -4995,7 +5009,7 @@ app.post(
       if (!req.file.originalname.toLowerCase().endsWith(".pdf")) {
         return res.status(400).send("Chỉ chấp nhận tài liệu PDF đã ký");
       }
-      const storedUrl = `http://localhost:4000/uploads/${req.file.filename}`;
+      const storedUrl = `${publicApiOrigin(req)}/uploads/${req.file.filename}`;
       const createdFile = await prisma.file.create({
         data: {
           caseId: caseItem.id,
@@ -5681,7 +5695,7 @@ app.post(
       for (let index = 0; index < req.files.length; index += 1) {
         const uploaded = req.files[index];
         const fileType = fileTypes[index] || fileTypes[0] || "OTHER";
-        const fileUrl = `http://localhost:4000/uploads/${uploaded.filename}`;
+        const fileUrl = `${publicApiOrigin(req)}/uploads/${uploaded.filename}`;
         const createdFile = await prisma.file.create({
           data: {
             caseId: id,
@@ -8590,7 +8604,7 @@ app.post(
 
 // ================== START SERVER ==================
 httpServer.listen(4000, () => {
-  console.log("Backend running at http://localhost:4000");
+  console.log("Backend listening on port 4000 (use http://<this-host>:4000 from clients)");
 });
 
 setInterval(runOverdueNotificationJob, 60 * 1000);

@@ -1,8 +1,9 @@
-import { StrictMode } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createTheme, CssBaseline, ThemeProvider } from "@mui/material";
 import "./index.css";
 import App from "./App.jsx";
+import ChatPopout from "./ChatPopout.jsx";
 import { I18nProvider } from "./i18n.jsx";
 
 const getValidationLocale = () =>
@@ -96,12 +97,26 @@ const theme = createTheme({
   },
 });
 
+function Root() {
+  const [hash, setHash] = useState(() => (typeof window !== "undefined" ? window.location.hash : ""));
+  useEffect(() => {
+    const onHash = () => setHash(window.location.hash);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const normalized = String(hash || "").replace(/\/$/, "");
+  if (normalized === "#/chat") {
+    return <ChatPopout />;
+  }
+  return <App />;
+}
+
 createRoot(document.getElementById('root')).render(
   <StrictMode>
     <I18nProvider>
       <ThemeProvider theme={theme}>
         <CssBaseline />
-        <App />
+        <Root />
       </ThemeProvider>
     </I18nProvider>
   </StrictMode>,

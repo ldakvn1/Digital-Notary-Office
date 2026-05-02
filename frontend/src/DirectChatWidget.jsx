@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
@@ -14,6 +14,7 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
+  Fab,
   InputAdornment,
   IconButton,
   Menu,
@@ -26,6 +27,7 @@ import {
   Typography,
 } from "@mui/material";
 import ChatIcon from "@mui/icons-material/Chat";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import CloseIcon from "@mui/icons-material/Close";
 import SearchIcon from "@mui/icons-material/Search";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -52,6 +54,7 @@ import ManageAccountsIcon from "@mui/icons-material/ManageAccounts";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
 import SwapHorizIcon from "@mui/icons-material/SwapHoriz";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import { io } from "socket.io-client";
 import { useI18n } from "./i18n";
 
@@ -74,9 +77,119 @@ const normalizeStatus = (value) => {
   return CHAT_STATUS_VALUES.includes(next) ? next : "AVAILABLE";
 };
 
-export default function DirectChatWidget({ currentUser, toastApi }) {
+/** Tooltip above chat Paper (zIndex 2000) and dialogs; default MUI tooltip z-index was too low → looked “broken”. */
+const CHAT_TOOLTIP_POPPER_SX = { zIndex: 10000 };
+
+const CHAT_SIDEBAR_WIDTH_STORAGE_KEY = "dno_chat_sidebar_width_px";
+const CHAT_SIDEBAR_MIN_PX = 180;
+const CHAT_SIDEBAR_MAX_PX = 560;
+const CHAT_SIDEBAR_DEFAULT_PX = 260;
+/** Pixels from bottom of the message scroller to treat as "at latest" (Teams-style jump button). */
+const CHAT_NEAR_BOTTOM_PX = 100;
+function chatUsernameKey(username) {
+  return String(username || "").trim().toLowerCase();
+}
+
+function chatMessageListMaxScrollTop(root) {
+  if (!root) return 0;
+  return Math.max(0, root.scrollHeight - root.clientHeight);
+}
+
+function chatMessageListDistanceFromBottom(root) {
+  if (!root) return 0;
+  return chatMessageListMaxScrollTop(root) - root.scrollTop;
+}
+
+function scrollChatMessageListToBottom(root) {
+  if (!root) return;
+  root.scrollTop = chatMessageListMaxScrollTop(root);
+}
+
+/** Scroll so `child` sits near the top of the scroll viewport (first-unread style). */
+function scrollChatMessageListToAnchorChild(root, child) {
+  if (!root || !child) return false;
+  const rootRect = root.getBoundingClientRect();
+  const childRect = child.getBoundingClientRect();
+  const delta = childRect.top - rootRect.top - 12;
+  const nextTop = Math.max(0, Math.min(chatMessageListMaxScrollTop(root), root.scrollTop + delta));
+  root.scrollTop = nextTop;
+  return true;
+}
+
+function ChatTruncationTooltip({ title, children }) {
+  const full = title != null ? String(title).trim() : "";
+  const boxRef = useRef(null);
+  const [truncated, setTruncated] = useState(false);
+
+  const measure = useCallback(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    setTruncated(el.scrollWidth > el.clientWidth + 1);
+  }, []);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, full]);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    const onWinResize = () => measure();
+    window.addEventListener("resize", onWinResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", onWinResize);
+    };
+  }, [measure]);
+
+  const box = (
+    <Box
+      ref={boxRef}
+      component="span"
+      onMouseEnter={measure}
+      sx={{
+        display: "block",
+        minWidth: 0,
+        maxWidth: "100%",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </Box>
+  );
+
+  if (!full || !truncated) {
+    return box;
+  }
+
+  return (
+    <Tooltip
+      title={full}
+      enterDelay={200}
+      disableInteractive
+      slotProps={{
+        popper: { sx: CHAT_TOOLTIP_POPPER_SX },
+        tooltip: {
+          sx: {
+            maxWidth: { xs: "min(92vw, 520px)", sm: 520 },
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          },
+        },
+      }}
+    >
+      {box}
+    </Tooltip>
+  );
+}
+
+export default function DirectChatWidget({ currentUser, toastApi, isPopout = false }) {
   const { t, language } = useI18n();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(isPopout));
   const [users, setUsers] = useState([]);
   const [groups, setGroups] = useState([]);
   const [directoryUsers, setDirectoryUsers] = useState([]);
@@ -154,11 +267,17 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
   const [pendingPastedImageCaption, setPendingPastedImageCaption] = useState("");
   const [socketConnected, setSocketConnected] = useState(false);
   const typingStopTimerRef = useRef(null);
+  const loadingMessagesRef = useRef(false);
+  const reloadConversationsAfterSocketRef = useRef(null);
   const typingActiveRef = useRef(false);
   const readSyncTimerRef = useRef(null);
   const lastRateLimitToastAtRef = useRef(0);
   const latestMessageIdByUserRef = useRef({});
   const messageListRef = useRef(null);
+  const nearBottomRef = useRef(true);
+  const prevDirectTailMessageIdRef = useRef(0);
+  const prevGroupTailMessageIdRef = useRef(0);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const socketRef = useRef(null);
   const selectedUsernameRef = useRef("");
   const fileInputRef = useRef(null);
@@ -171,6 +290,71 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
   const voiceChunksRef = useRef([]);
   const voiceRecordTimerRef = useRef(null);
   const voiceAutoStopTimerRef = useRef(null);
+  const chatPaperRef = useRef(null);
+  const sidebarResizeRef = useRef({ active: false, startX: 0, startW: 0 });
+  const chatSidebarWidthPxRef = useRef(CHAT_SIDEBAR_DEFAULT_PX);
+  const [chatSidebarWidthPx, setChatSidebarWidthPx] = useState(() => {
+    if (typeof window === "undefined") return CHAT_SIDEBAR_DEFAULT_PX;
+    try {
+      const raw = localStorage.getItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY);
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return CHAT_SIDEBAR_DEFAULT_PX;
+      return Math.min(CHAT_SIDEBAR_MAX_PX, Math.max(CHAT_SIDEBAR_MIN_PX, Math.round(n)));
+    } catch (_err) {
+      return CHAT_SIDEBAR_DEFAULT_PX;
+    }
+  });
+
+  useEffect(() => {
+    chatSidebarWidthPxRef.current = chatSidebarWidthPx;
+  }, [chatSidebarWidthPx]);
+
+  useEffect(() => {
+    const onMove = (e) => {
+      const drag = sidebarResizeRef.current;
+      if (!drag.active) return;
+      const paper = chatPaperRef.current;
+      const rect = paper?.getBoundingClientRect();
+      const maxW = rect?.width
+        ? Math.min(CHAT_SIDEBAR_MAX_PX, Math.max(CHAT_SIDEBAR_MIN_PX, Math.floor(rect.width * 0.65)))
+        : CHAT_SIDEBAR_MAX_PX;
+      const deltaX = e.clientX - drag.startX;
+      const next = Math.round(Math.min(maxW, Math.max(CHAT_SIDEBAR_MIN_PX, drag.startW + deltaX)));
+      setChatSidebarWidthPx(next);
+    };
+    const onUp = () => {
+      const drag = sidebarResizeRef.current;
+      if (!drag.active) return;
+      drag.active = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      try {
+        localStorage.setItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY, String(chatSidebarWidthPxRef.current));
+      } catch (_err) {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const beginSidebarResize = useCallback((event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    sidebarResizeRef.current = {
+      active: true,
+      startX: event.clientX,
+      startW: chatSidebarWidthPxRef.current,
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  useEffect(() => {
+    loadingMessagesRef.current = loadingMessages;
+  }, [loadingMessages]);
 
   const selectedUser = useMemo(() => {
     const merged = [...users, ...directoryUsers];
@@ -211,6 +395,19 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       groups.reduce((sum, item) => sum + Number(item.unreadCount || 0), 0),
     [users, groups]
   );
+  const directUnreadBadgeCount = useMemo(() => {
+    const muted = new Set(mutedDirectUsernames.map((u) => String(u || "").toLowerCase()));
+    return users.reduce((sum, item) => {
+      if (muted.has(String(item.username || "").toLowerCase())) return sum;
+      return sum + Number(item.unreadCount || 0);
+    }, 0);
+  }, [users, mutedDirectUsernames]);
+  const groupUnreadBadgeCount = useMemo(() => {
+    return groups.reduce((sum, item) => {
+      if (mutedGroupIds.includes(Number(item.id))) return sum;
+      return sum + Number(item.unreadCount || 0);
+    }, 0);
+  }, [groups, mutedGroupIds]);
   const filteredUsers = useMemo(() => {
     const q = String(userSearch || "").toLowerCase().trim();
     if (!q) return users;
@@ -728,7 +925,11 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
 
   const loadGroupMessages = async (groupId, silent = false) => {
     if (!groupId) return;
-    if (!silent) setLoadingMessages(true);
+    if (!silent) {
+      setLoadingMessages(true);
+      setGroupMessages([]);
+      prevGroupTailMessageIdRef.current = 0;
+    }
     try {
       const res = await axios.get(`${API_BASE}/chat/groups/${Number(groupId)}/messages`, {
         params: { limit: 120 },
@@ -744,7 +945,11 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
 
   const loadConversation = async (username, silent = false) => {
     if (!username) return;
-    if (!silent) setLoadingMessages(true);
+    if (!silent) {
+      setLoadingMessages(true);
+      setMessages([]);
+      prevDirectTailMessageIdRef.current = 0;
+    }
     try {
       const res = await axios.get(`${API_BASE}/chat/direct/${encodeURIComponent(username)}`, {
         params: { limit: 100 },
@@ -876,47 +1081,60 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     });
     socket.on("chat:presence", ({ username, online, status }) => {
       if (!username) return;
+      const key = chatUsernameKey(username);
       setUsers((prev) =>
         prev.map((item) =>
-          item.username === username
+          chatUsernameKey(item.username) === key
             ? { ...item, online: Boolean(online), status: String(status || item.status || "AVAILABLE") }
             : item
         )
       );
     });
     socket.on("chat:typing", ({ fromUsername, typing }) => {
-      if (String(fromUsername || "") === String(selectedUsernameRef.current || "")) {
+      if (chatUsernameKey(fromUsername) === chatUsernameKey(selectedUsernameRef.current || "")) {
         setPeerTyping(Boolean(typing));
       }
     });
     socket.on("chat:message", (payload) => {
       if (!payload) return;
       const targetUsername = payload.isMine ? payload.receiverUsername : payload.senderUsername;
-      const isMutedDirect = mutedDirectUsernames.includes(String(targetUsername || ""));
+      const targetKey = chatUsernameKey(targetUsername);
+      const selectedKey = chatUsernameKey(selectedUsernameRef.current || "");
+      const isMutedDirect = mutedDirectUsernames.some((u) => chatUsernameKey(u) === targetKey);
       if (!payload.isMine && !isMutedDirect) {
         playIncomingSound();
       }
-      setUsers((prev) =>
-        prev.map((item) =>
-          item.username === targetUsername
-            ? {
-                ...item,
-                lastMessageText: payload.attachmentName
-                  ? `[${t("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
-                  : payload.content || "",
-                lastMessageAt: payload.createdAt || null,
-                unreadCount:
-                  payload.isMine || item.username === selectedUsernameRef.current
-                    ? item.unreadCount || 0
-                    : Number(item.unreadCount || 0) + 1,
-              }
-            : item
-        )
-      );
+      const bumpRow = (item) => {
+        if (chatUsernameKey(item.username) !== targetKey) return item;
+        return {
+          ...item,
+          lastMessageText: payload.attachmentName
+            ? `[${t("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
+            : payload.content || "",
+          lastMessageAt: payload.createdAt || null,
+          unreadCount:
+            payload.isMine || chatUsernameKey(item.username) === selectedKey
+              ? item.unreadCount || 0
+              : Number(item.unreadCount || 0) + 1,
+        };
+      };
+      setUsers((prev) => {
+        const hasPeer = prev.some((item) => chatUsernameKey(item.username) === targetKey);
+        if (!hasPeer) {
+          if (reloadConversationsAfterSocketRef.current) clearTimeout(reloadConversationsAfterSocketRef.current);
+          reloadConversationsAfterSocketRef.current = setTimeout(() => {
+            reloadConversationsAfterSocketRef.current = null;
+            loadUsers();
+          }, 350);
+          return prev;
+        }
+        return prev.map((item) => bumpRow(item));
+      });
+      setDirectoryUsers((prev) => prev.map((item) => bumpRow(item)));
       const relatedToSelected =
-        String(selectedUsernameRef.current || "") &&
-        (String(payload.senderUsername || "") === String(selectedUsernameRef.current) ||
-          String(payload.receiverUsername || "") === String(selectedUsernameRef.current));
+        selectedKey &&
+        (chatUsernameKey(payload.senderUsername || "") === selectedKey ||
+          chatUsernameKey(payload.receiverUsername || "") === selectedKey);
       if (relatedToSelected) {
         setMessages((prev) => {
           if (prev.some((item) => Number(item.id) === Number(payload.id))) return prev;
@@ -982,7 +1200,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       );
       setUsers((prev) =>
         prev.map((item) =>
-          item.username === selectedUsernameRef.current
+          chatUsernameKey(item.username) === chatUsernameKey(selectedUsernameRef.current || "")
             ? {
                 ...item,
                 lastMessageText: payload.isDeleted
@@ -1005,25 +1223,26 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     socket.on("chat:conversation-deleted", ({ username }) => {
       const removedUsername = String(username || "").trim();
       if (!removedUsername) return;
-      setUsers((prev) => prev.filter((item) => item.username !== removedUsername));
-      if (String(selectedUsernameRef.current || "") === removedUsername) {
+      const removedKey = chatUsernameKey(removedUsername);
+      setUsers((prev) => prev.filter((item) => chatUsernameKey(item.username) !== removedKey));
+      if (chatUsernameKey(selectedUsernameRef.current || "") === removedKey) {
         setMessages([]);
         setSelectedUsername("");
       }
     });
     socket.on("chat:read", ({ byUsername }) => {
-      if (String(byUsername || "") !== String(selectedUsernameRef.current || "")) return;
+      if (chatUsernameKey(byUsername) !== chatUsernameKey(selectedUsernameRef.current || "")) return;
       setMessages((prev) =>
         prev.map((item) => (item.isMine && !item.readAt ? { ...item, readAt: new Date().toISOString() } : item))
       );
       setUsers((prev) =>
         prev.map((item) =>
-          String(item.username || "") === String(byUsername || "") ? { ...item, unreadCount: 0 } : item
+          chatUsernameKey(item.username) === chatUsernameKey(byUsername || "") ? { ...item, unreadCount: 0 } : item
         )
       );
     });
     socket.on("chat:delivered", ({ byUsername }) => {
-      if (String(byUsername || "") !== String(selectedUsernameRef.current || "")) return;
+      if (chatUsernameKey(byUsername) !== chatUsernameKey(selectedUsernameRef.current || "")) return;
       setMessages((prev) =>
         prev.map((item) =>
           item.isMine && !item.readAt && !item.deliveredAt ? { ...item, deliveredAt: new Date().toISOString() } : item
@@ -1031,6 +1250,10 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       );
     });
     return () => {
+      if (reloadConversationsAfterSocketRef.current) {
+        clearTimeout(reloadConversationsAfterSocketRef.current);
+        reloadConversationsAfterSocketRef.current = null;
+      }
       socket.disconnect();
       socketRef.current = null;
     };
@@ -1064,9 +1287,11 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
   }, [pendingVoiceUrl, pendingPastedImageUrl]);
 
   useEffect(() => {
-    if (!open) return;
     if (readSyncTimerRef.current) clearTimeout(readSyncTimerRef.current);
+    if (!open) return;
+    if (loadingMessagesRef.current) return;
     readSyncTimerRef.current = setTimeout(() => {
+      if (loadingMessagesRef.current) return;
       if (chatMode === "group" && selectedGroupId) {
         axios.post(`${API_BASE}/chat/groups/${Number(selectedGroupId)}/read`).catch(() => {});
       } else if (chatMode === "direct" && selectedUsername) {
@@ -1076,7 +1301,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     return () => {
       if (readSyncTimerRef.current) clearTimeout(readSyncTimerRef.current);
     };
-  }, [open, selectedUsername, selectedGroupId, chatMode, messages.length, groupMessages.length]);
+  }, [open, selectedUsername, selectedGroupId, chatMode, loadingMessages]);
 
   useEffect(() => {
     if (!open || !selectedUsername || socketConnected) return;
@@ -1100,34 +1325,132 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       .catch(() => {});
   };
 
-  useEffect(() => {
-    if (!open || loadingMessages) return;
-    const el = messageListRef.current;
-    if (!el) return;
-    const scrollToEnd = () => {
-      el.scrollTop = el.scrollHeight;
-    };
-    scrollToEnd();
-    const raf = requestAnimationFrame(() => {
-      scrollToEnd();
-      requestAnimationFrame(scrollToEnd);
+  const handleMessageListScroll = useCallback(() => {
+    const root = messageListRef.current;
+    if (!root) return;
+    const d = chatMessageListDistanceFromBottom(root);
+    const maxScroll = chatMessageListMaxScrollTop(root);
+    nearBottomRef.current = d <= CHAT_NEAR_BOTTOM_PX;
+    if (maxScroll <= 4) {
+      setShowJumpToLatest(false);
+      return;
+    }
+    setShowJumpToLatest(d > CHAT_NEAR_BOTTOM_PX);
+  }, []);
+
+  const handleJumpToLatestClick = useCallback(() => {
+    const root = messageListRef.current;
+    scrollChatMessageListToBottom(root);
+    nearBottomRef.current = true;
+    setShowJumpToLatest(false);
+  }, []);
+
+  const scheduleScrollToBottomAfterOwnSend = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const root = messageListRef.current;
+        scrollChatMessageListToBottom(root);
+        nearBottomRef.current = true;
+        setShowJumpToLatest(false);
+      });
     });
-    const t0 = setTimeout(scrollToEnd, 0);
-    const t1 = setTimeout(scrollToEnd, 80);
-    return () => {
-      cancelAnimationFrame(raf);
-      clearTimeout(t0);
-      clearTimeout(t1);
+  }, []);
+
+  useEffect(() => {
+    prevDirectTailMessageIdRef.current = 0;
+    nearBottomRef.current = true;
+  }, [selectedUsername]);
+
+  useEffect(() => {
+    prevGroupTailMessageIdRef.current = 0;
+    nearBottomRef.current = true;
+  }, [selectedGroupId]);
+
+  useEffect(() => {
+    setShowJumpToLatest(false);
+  }, [selectedUsername, selectedGroupId, chatMode]);
+
+  /** After opening a thread (load finished): scroll to first unread if any, else bottom — only within the list (no scrollIntoView). */
+  useLayoutEffect(() => {
+    if (!open || loadingMessages) return;
+    if (chatMode === "direct" && !selectedUsername) return;
+    if (chatMode === "group" && !selectedGroupId) return;
+    const root = messageListRef.current;
+    if (!root) return;
+    const hasRows =
+      chatMode === "direct" ? messages.length > 0 : chatMode === "group" ? groupMessages.length > 0 : false;
+    if (!hasRows) return;
+
+    const firstUnreadDirect = messages.find((m) => !m.isMine && !m.readAt && !m.isDeleted);
+    const groupUnread = Math.min(Number(selectedGroup?.unreadCount || 0), groupMessages.length);
+    let anchorId = null;
+    if (chatMode === "direct") {
+      anchorId = firstUnreadDirect ? Number(firstUnreadDirect.id) : null;
+    } else if (groupUnread > 0) {
+      let idx = Math.max(0, groupMessages.length - groupUnread);
+      while (idx < groupMessages.length && groupMessages[idx]?.isMine) idx += 1;
+      if (idx < groupMessages.length) anchorId = Number(groupMessages[idx]?.id || 0) || null;
+    }
+
+    const applyScroll = () => {
+      if (anchorId) {
+        const el = root.querySelector(`[data-chat-message-id="${anchorId}"]`);
+        if (el) scrollChatMessageListToAnchorChild(root, el);
+        else scrollChatMessageListToBottom(root);
+      } else {
+        scrollChatMessageListToBottom(root);
+      }
     };
-  }, [
-    open,
-    loadingMessages,
-    chatMode,
-    selectedUsername,
-    selectedGroupId,
-    messages.length,
-    groupMessages.length,
-  ]);
+
+    applyScroll();
+    const raf1 = requestAnimationFrame(applyScroll);
+    const raf2 = requestAnimationFrame(() => requestAnimationFrame(applyScroll));
+    const t1 = setTimeout(applyScroll, 60);
+    const t2 = setTimeout(() => {
+      applyScroll();
+      nearBottomRef.current = chatMessageListDistanceFromBottom(root) <= CHAT_NEAR_BOTTOM_PX;
+      const maxS = chatMessageListMaxScrollTop(root);
+      setShowJumpToLatest(maxS > 4 && !nearBottomRef.current);
+    }, 160);
+    const t3 = setTimeout(applyScroll, 320);
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [open, loadingMessages, chatMode, selectedUsername, selectedGroupId]);
+
+  /** If the newest message id changed while already viewing the thread, keep pinned to bottom only when the user was near the bottom (new incoming / own send). */
+  useLayoutEffect(() => {
+    if (!open || loadingMessages) return;
+    const root = messageListRef.current;
+    if (!root) return;
+    if (chatMode === "direct") {
+      if (!selectedUsername || messages.length === 0) return;
+      const tailId = Number(messages[messages.length - 1]?.id || 0);
+      if (tailId === prevDirectTailMessageIdRef.current) return;
+      const hadBefore = prevDirectTailMessageIdRef.current !== 0;
+      prevDirectTailMessageIdRef.current = tailId;
+      if (!hadBefore) return;
+      if (!nearBottomRef.current) return;
+      scrollChatMessageListToBottom(root);
+      setShowJumpToLatest(false);
+      return;
+    }
+    if (chatMode === "group") {
+      if (!selectedGroupId || groupMessages.length === 0) return;
+      const tailId = Number(groupMessages[groupMessages.length - 1]?.id || 0);
+      if (tailId === prevGroupTailMessageIdRef.current) return;
+      const hadBefore = prevGroupTailMessageIdRef.current !== 0;
+      prevGroupTailMessageIdRef.current = tailId;
+      if (!hadBefore) return;
+      if (!nearBottomRef.current) return;
+      scrollChatMessageListToBottom(root);
+      setShowJumpToLatest(false);
+    }
+  }, [open, loadingMessages, chatMode, selectedUsername, selectedGroupId, messages, groupMessages]);
   useEffect(() => {
     setGroupSearchIndex(0);
   }, [groupMessageSearch, selectedGroupId, chatMode]);
@@ -1157,6 +1480,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
             if (prev.some((item) => Number(item.id) === Number(res.data?.id))) return prev;
             return [...prev, res.data];
           });
+          scheduleScrollToBottomAfterOwnSend();
         } else {
           const res =
             editingMessageId !== null
@@ -1174,6 +1498,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
             }
             return [...prev, res.data];
           });
+          if (editingMessageId === null) scheduleScrollToBottomAfterOwnSend();
         }
       }
       setDraft("");
@@ -1369,6 +1694,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       }
       loadUsers();
       loadGroups();
+      scheduleScrollToBottomAfterOwnSend();
     } catch (error) {
       console.error(error);
       toastApi?.error(error?.response?.data?.message || error?.response?.data || t("chatWidget.uploadAttachmentError"));
@@ -2012,9 +2338,31 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     closeDeleteConfirmDialog();
   };
 
+  const openDetachedChatWindow = () => {
+    try {
+      const url = `${window.location.origin}${window.location.pathname}${window.location.search}#/chat`;
+      const target = "DigitalNotaryChatPopout";
+      const features = ["width=920", "height=780", "resizable=yes", "scrollbars=yes"].join(",");
+      const popup = window.open(url, target, features);
+      if (!popup) {
+        toastApi?.warning(t("chatWidget.popoutBlocked"));
+        return;
+      }
+      try {
+        popup.focus();
+      } catch (_e) {
+        /* ignore */
+      }
+      setOpen(false);
+    } catch (error) {
+      console.error(error);
+      toastApi?.error(t("chatWidget.popoutOpenError"));
+    }
+  };
+
   return (
     <>
-      {!open && (
+      {!isPopout && !open && (
         <Box
           sx={{
             position: "fixed",
@@ -2047,31 +2395,56 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       {open && (
         <Portal>
           <Paper
-            sx={{
-              position: "fixed",
-              right: 18,
-              bottom: "calc(18px + env(safe-area-inset-bottom, 0px))",
-              width: { xs: "calc(100vw - 24px)", sm: 740 },
-              maxWidth: "calc(100vw - 24px)",
-              height: { xs: "min(72dvh, 640px)", sm: "min(78dvh, 760px)" },
-              zIndex: 2000,
-              borderRadius: 2.5,
-              overflow: "hidden",
-              boxShadow: "0 24px 54px rgba(2,6,23,0.35)",
-              border: "1px solid rgba(148,163,184,0.28)",
-              bgcolor: "rgba(248,250,252,0.94)",
-              backdropFilter: "blur(10px)",
-              display: "grid",
-              gridTemplateColumns: { xs: "1fr", sm: "260px 1fr" },
-            }}
+            ref={chatPaperRef}
+            sx={
+              isPopout
+                ? {
+                    position: "fixed",
+                    inset: 0,
+                    right: "auto",
+                    bottom: "auto",
+                    width: "100%",
+                    maxWidth: "100%",
+                    height: "100%",
+                    maxHeight: "100%",
+                    zIndex: 2000,
+                    borderRadius: 0,
+                    overflow: "hidden",
+                    boxShadow: "none",
+                    border: "none",
+                    bgcolor: "rgba(248,250,252,0.98)",
+                    backdropFilter: "none",
+                    display: "grid",
+                    gridTemplateColumns: { xs: "1fr", sm: `${chatSidebarWidthPx}px 1fr` },
+                  }
+                : {
+                    position: "fixed",
+                    right: 18,
+                    bottom: "calc(18px + env(safe-area-inset-bottom, 0px))",
+                    width: { xs: "calc(100vw - 24px)", sm: 740 },
+                    maxWidth: "calc(100vw - 24px)",
+                    height: { xs: "min(72dvh, 640px)", sm: "min(78dvh, 760px)" },
+                    zIndex: 2000,
+                    borderRadius: 2.5,
+                    overflow: "hidden",
+                    boxShadow: "0 24px 54px rgba(2,6,23,0.35)",
+                    border: "1px solid rgba(148,163,184,0.28)",
+                    bgcolor: "rgba(248,250,252,0.94)",
+                    backdropFilter: "blur(10px)",
+                    display: "grid",
+                    gridTemplateColumns: { xs: "1fr", sm: `${chatSidebarWidthPx}px 1fr` },
+                  }
+            }
           >
           <Box
             sx={{
+              position: "relative",
               borderRight: { xs: "none", sm: "1px solid" },
               borderColor: "rgba(148,163,184,0.28)",
               display: "flex",
               flexDirection: "column",
               minHeight: 0,
+              minWidth: 0,
               overflow: "hidden",
               bgcolor: "rgba(241,245,249,0.82)",
             }}
@@ -2089,18 +2462,22 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
               }}
             >
               <Box sx={{ minWidth: 0, flex: 1 }}>
-                <Typography
-                  variant="subtitle1"
-                  sx={{
-                    fontWeight: 850,
-                    letterSpacing: 0.1,
-                    color: "text.primary",
-                    lineHeight: 1.2,
-                  }}
-                  noWrap
+                <ChatTruncationTooltip
+                  title={String(currentUser?.fullName || currentUser?.username || "").trim() || t("chatWidget.title")}
                 >
-                  {String(currentUser?.fullName || currentUser?.username || "").trim() || t("chatWidget.title")}
-                </Typography>
+                  <Typography
+                    variant="subtitle1"
+                    component="span"
+                    sx={{
+                      fontWeight: 850,
+                      letterSpacing: 0.1,
+                      color: "text.primary",
+                      lineHeight: 1.2,
+                    }}
+                  >
+                    {String(currentUser?.fullName || currentUser?.username || "").trim() || t("chatWidget.title")}
+                  </Typography>
+                </ChatTruncationTooltip>
               </Box>
               <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
                 <Button
@@ -2124,7 +2501,27 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                     }}
                   />
                 </Button>
-                <IconButton size="small" onClick={() => setOpen(false)} sx={{ color: "text.secondary" }}>
+                {!isPopout && (
+                  <Tooltip
+                    title={t("chatWidget.popoutOpenTooltip")}
+                    slotProps={{ popper: { sx: CHAT_TOOLTIP_POPPER_SX } }}
+                  >
+                    <IconButton
+                      size="small"
+                      onClick={openDetachedChatWindow}
+                      sx={{ color: "text.secondary" }}
+                      aria-label={t("chatWidget.popoutOpenAria")}
+                    >
+                      <OpenInNewIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                <IconButton
+                  size="small"
+                  onClick={() => (isPopout ? window.close() : setOpen(false))}
+                  sx={{ color: "text.secondary" }}
+                  aria-label={isPopout ? t("chatWidget.popoutCloseWindow") : t("common.close")}
+                >
                   <CloseIcon fontSize="small" />
                 </IconButton>
               </Box>
@@ -2152,42 +2549,82 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                   boxShadow: "inset 0 1px 0 rgba(255,255,255,0.7)",
                 }}
               >
-                <Button
-                  size="small"
-                  onClick={() => setChatMode("direct")}
+                <Badge
+                  color="error"
+                  overlap="rectangular"
+                  invisible={directUnreadBadgeCount <= 0}
+                  badgeContent={directUnreadBadgeCount > 99 ? "99+" : directUnreadBadgeCount}
+                  anchorOrigin={{ vertical: "top", horizontal: "right" }}
                   sx={{
-                    minWidth: 72,
                     borderRadius: 999,
-                    px: 1.5,
-                    fontWeight: 700,
-                    color: chatMode === "direct" ? "#fff" : "text.primary",
-                    bgcolor: chatMode === "direct" ? "primary.main" : "transparent",
-                    boxShadow: chatMode === "direct" ? "0 6px 14px rgba(37,99,235,0.32)" : "none",
-                    "&:hover": {
-                      bgcolor: chatMode === "direct" ? "primary.main" : "rgba(148,163,184,0.16)",
+                    "& .MuiBadge-badge": {
+                      fontSize: 10,
+                      fontWeight: 800,
+                      minWidth: 18,
+                      height: 18,
+                      px: 0.45,
+                      right: 10,
+                      top: 4,
                     },
                   }}
                 >
-                  {t("chatWidget.directTab")}
-                </Button>
-                <Button
-                  size="small"
-                  onClick={() => setChatMode("group")}
+                  <Button
+                    size="small"
+                    onClick={() => setChatMode("direct")}
+                    sx={{
+                      minWidth: 72,
+                      borderRadius: 999,
+                      px: 1.5,
+                      fontWeight: 700,
+                      color: chatMode === "direct" ? "#fff" : "text.primary",
+                      bgcolor: chatMode === "direct" ? "primary.main" : "transparent",
+                      boxShadow: chatMode === "direct" ? "0 6px 14px rgba(37,99,235,0.32)" : "none",
+                      "&:hover": {
+                        bgcolor: chatMode === "direct" ? "primary.main" : "rgba(148,163,184,0.16)",
+                      },
+                    }}
+                  >
+                    {t("chatWidget.directTab")}
+                  </Button>
+                </Badge>
+                <Badge
+                  color="error"
+                  overlap="rectangular"
+                  invisible={groupUnreadBadgeCount <= 0}
+                  badgeContent={groupUnreadBadgeCount > 99 ? "99+" : groupUnreadBadgeCount}
+                  anchorOrigin={{ vertical: "top", horizontal: "right" }}
                   sx={{
-                    minWidth: 78,
                     borderRadius: 999,
-                    px: 1.5,
-                    fontWeight: 700,
-                    color: chatMode === "group" ? "#fff" : "text.primary",
-                    bgcolor: chatMode === "group" ? "primary.main" : "transparent",
-                    boxShadow: chatMode === "group" ? "0 6px 14px rgba(37,99,235,0.32)" : "none",
-                    "&:hover": {
-                      bgcolor: chatMode === "group" ? "primary.main" : "rgba(148,163,184,0.16)",
+                    "& .MuiBadge-badge": {
+                      fontSize: 10,
+                      fontWeight: 800,
+                      minWidth: 18,
+                      height: 18,
+                      px: 0.45,
+                      right: 10,
+                      top: 4,
                     },
                   }}
                 >
-                  {t("chatWidget.groupTab")}
-                </Button>
+                  <Button
+                    size="small"
+                    onClick={() => setChatMode("group")}
+                    sx={{
+                      minWidth: 78,
+                      borderRadius: 999,
+                      px: 1.5,
+                      fontWeight: 700,
+                      color: chatMode === "group" ? "#fff" : "text.primary",
+                      bgcolor: chatMode === "group" ? "primary.main" : "transparent",
+                      boxShadow: chatMode === "group" ? "0 6px 14px rgba(37,99,235,0.32)" : "none",
+                      "&:hover": {
+                        bgcolor: chatMode === "group" ? "primary.main" : "rgba(148,163,184,0.16)",
+                      },
+                    }}
+                  >
+                    {t("chatWidget.groupTab")}
+                  </Button>
+                </Badge>
               </Box>
               <Button
                 size="small"
@@ -2345,11 +2782,13 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                           {String(item.name || "G").slice(0, 1).toUpperCase()}
                         </Avatar>
                         <Box sx={{ textAlign: "left", minWidth: 0, width: "100%", flex: 1 }}>
-                          <Typography variant="body2" fontWeight={600} noWrap>
-                            {renderHighlightedText(item.name, normalizedSearchQuery)}
-                            {pinnedGroupIds.includes(Number(item.id)) ? " 📌" : ""}
-                            {mutedGroupIds.includes(Number(item.id)) ? " 🔕" : ""}
-                          </Typography>
+                          <ChatTruncationTooltip title={String(item.name || "")}>
+                            <Typography variant="body2" component="span" fontWeight={600}>
+                              {renderHighlightedText(item.name, normalizedSearchQuery)}
+                              {pinnedGroupIds.includes(Number(item.id)) ? " 📌" : ""}
+                              {mutedGroupIds.includes(Number(item.id)) ? " 🔕" : ""}
+                            </Typography>
+                          </ChatTruncationTooltip>
                           <Stack direction="row" spacing={0.75} alignItems="center">
                             <Typography variant="caption" color="text.secondary" noWrap>
                               {(item.members || []).length} {t("chatWidget.members")}
@@ -2434,13 +2873,17 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                               bgcolor: Number(item.unreadCount || 0) > 0 ? "rgba(239,68,68,0.08)" : "rgba(255,255,255,0.66)",
                             }}
                           >
-                            <Box sx={{ textAlign: "left", minWidth: 0 }}>
-                              <Typography variant="caption" fontWeight={700} noWrap>
-                                {item.name}
-                              </Typography>
-                              <Typography variant="caption" color="text.secondary" noWrap sx={{ display: "block" }}>
-                                {renderHighlightedText(item.snippet, normalizedSearchQuery)}
-                              </Typography>
+                            <Box sx={{ textAlign: "left", minWidth: 0, flex: 1 }}>
+                              <ChatTruncationTooltip title={String(item.name || "")}>
+                                <Typography variant="caption" component="span" fontWeight={700}>
+                                  {item.name}
+                                </Typography>
+                              </ChatTruncationTooltip>
+                              <ChatTruncationTooltip title={String(item.snippet || "")}>
+                                <Typography variant="caption" color="text.secondary" component="span">
+                                  {renderHighlightedText(item.snippet, normalizedSearchQuery)}
+                                </Typography>
+                              </ChatTruncationTooltip>
                             </Box>
                           </Button>
                         ))}
@@ -2506,11 +2949,13 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                           {String(item.fullName || item.username || "U").slice(0, 1).toUpperCase()}
                         </Avatar>
                       </Badge>
-                      <Box sx={{ textAlign: "left", minWidth: 0 }}>
-                        <Typography variant="body2" fontWeight={600} noWrap>
-                          {renderHighlightedText(item.fullName || item.username, normalizedSearchQuery)}
-                          {mutedDirectUsernames.includes(String(item.username || "")) ? " 🔕" : ""}
-                        </Typography>
+                      <Box sx={{ textAlign: "left", minWidth: 0, flex: 1 }}>
+                        <ChatTruncationTooltip title={String(item.fullName || item.username || "").trim()}>
+                          <Typography variant="body2" component="span" fontWeight={600}>
+                            {renderHighlightedText(item.fullName || item.username, normalizedSearchQuery)}
+                            {mutedDirectUsernames.includes(String(item.username || "")) ? " 🔕" : ""}
+                          </Typography>
+                        </ChatTruncationTooltip>
                         <Stack direction="row" spacing={0.75} alignItems="center">
                           <Typography variant="caption" color="text.secondary" noWrap>
                             {getStatusLabel(item.status, item.online)}
@@ -2579,13 +3024,17 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                             bgcolor: Number(item.unreadCount || 0) > 0 ? "rgba(239,68,68,0.08)" : "rgba(255,255,255,0.66)",
                           }}
                         >
-                          <Box sx={{ textAlign: "left", minWidth: 0 }}>
-                            <Typography variant="caption" fontWeight={700} noWrap>
-                              {item.fullName || item.username}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary" noWrap sx={{ display: "block" }}>
-                              {renderHighlightedText(item.snippet, normalizedSearchQuery)}
-                            </Typography>
+                          <Box sx={{ textAlign: "left", minWidth: 0, flex: 1 }}>
+                            <ChatTruncationTooltip title={String(item.fullName || item.username || "").trim()}>
+                              <Typography variant="caption" component="span" fontWeight={700}>
+                                {item.fullName || item.username}
+                              </Typography>
+                            </ChatTruncationTooltip>
+                            <ChatTruncationTooltip title={String(item.snippet || "")}>
+                              <Typography variant="caption" color="text.secondary" component="span">
+                                {renderHighlightedText(item.snippet, normalizedSearchQuery)}
+                              </Typography>
+                            </ChatTruncationTooltip>
                           </Box>
                         </Button>
                       ))}
@@ -2594,24 +3043,68 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                 </Stack>
               )}
             </Box>
+            <Box
+              role="separator"
+              aria-orientation="vertical"
+              aria-label={t("chatWidget.resizeSidebar")}
+              onMouseDown={beginSidebarResize}
+              sx={{
+                display: { xs: "none", sm: "block" },
+                position: "absolute",
+                right: 0,
+                top: 0,
+                bottom: 0,
+                width: 10,
+                marginRight: "-5px",
+                zIndex: 3,
+                cursor: "col-resize",
+                touchAction: "none",
+                bgcolor: "transparent",
+                "&:hover": { bgcolor: "rgba(59,130,246,0.12)" },
+              }}
+            />
           </Box>
 
           <Box sx={{ display: "flex", flexDirection: "column", minHeight: 0, bgcolor: "rgba(255,255,255,0.88)" }}>
-            <Box sx={{ p: 1.5, borderBottom: "1px solid", borderColor: "rgba(148,163,184,0.24)", bgcolor: "rgba(255,255,255,0.74)" }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 800, letterSpacing: 0.15 }}>
-                {chatMode === "group"
-                  ? selectedGroup?.name || t("chatWidget.selectGroup")
-                  : selectedUser
-                    ? selectedUser.fullName
-                    : t("chatWidget.selectUser")}
-              </Typography>
+            <Box
+              sx={{
+                p: 1.5,
+                borderBottom: "1px solid",
+                borderColor: "rgba(148,163,184,0.24)",
+                bgcolor: "rgba(255,255,255,0.74)",
+                minWidth: 0,
+              }}
+            >
+              <ChatTruncationTooltip
+                title={
+                  chatMode === "group"
+                    ? String(selectedGroup?.name || "").trim() || t("chatWidget.selectGroup")
+                    : selectedUser
+                      ? String(selectedUser.fullName || selectedUser.username || "").trim()
+                      : t("chatWidget.selectUser")
+                }
+              >
+                <Typography variant="subtitle2" component="span" sx={{ fontWeight: 800, letterSpacing: 0.15 }}>
+                  {chatMode === "group"
+                    ? selectedGroup?.name || t("chatWidget.selectGroup")
+                    : selectedUser
+                      ? selectedUser.fullName || selectedUser.username
+                      : t("chatWidget.selectUser")}
+                </Typography>
+              </ChatTruncationTooltip>
               {chatMode === "group" && selectedGroup && (
-                <Typography variant="caption" color="text.secondary">
-                  {(selectedGroup.members || [])
-                    .slice(0, 5)
+                <ChatTruncationTooltip
+                  title={(selectedGroup.members || [])
                     .map((member) => member.fullName || member.username)
                     .join(", ")}
-                </Typography>
+                >
+                  <Typography variant="caption" color="text.secondary" component="span">
+                    {(selectedGroup.members || [])
+                      .slice(0, 5)
+                      .map((member) => member.fullName || member.username)
+                      .join(", ")}
+                  </Typography>
+                </ChatTruncationTooltip>
               )}
               {chatMode === "group" && selectedGroup && (
                 <Box sx={{ mt: 1, display: "flex", gap: 1, alignItems: "center" }}>
@@ -2666,20 +3159,22 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
               )}
             </Box>
 
-            <Box
-              ref={messageListRef}
-              sx={{
-                flex: 1,
-                minHeight: 0,
-                overflowY: "auto",
-                p: 1.5,
-                pb: 1,
-                display: "flex",
-                flexDirection: "column",
-                gap: 1,
-                bgcolor: "rgba(248,250,252,0.55)",
-              }}
-            >
+            <Box sx={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              <Box
+                ref={messageListRef}
+                onScroll={handleMessageListScroll}
+                sx={{
+                  flex: 1,
+                  minHeight: 0,
+                  overflowY: "auto",
+                  p: 1.5,
+                  pb: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 1,
+                  bgcolor: "rgba(248,250,252,0.55)",
+                }}
+              >
               {chatMode === "group" && !selectedGroupId ? (
                 <Typography variant="body2" color="text.secondary">
                   {t("chatWidget.selectGroupHint")}
@@ -2714,6 +3209,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                     return (
                     <Box
                       key={message.id}
+                      data-chat-message-id={message.id}
                       sx={{
                         alignSelf: message.isMine ? "flex-end" : "flex-start",
                         maxWidth: "72%",
@@ -2745,9 +3241,15 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                       }}
                     >
                       {chatMode === "group" && !message.isMine && (
-                        <Typography variant="caption" sx={{ opacity: 0.9, fontWeight: 700, display: "block", mb: 0.3 }}>
-                          {message.senderFullName || message.senderUsername}
-                        </Typography>
+                        <ChatTruncationTooltip title={String(message.senderFullName || message.senderUsername || "").trim()}>
+                          <Typography
+                            variant="caption"
+                            component="span"
+                            sx={{ opacity: 0.9, fontWeight: 700, mb: 0.3, display: "block" }}
+                          >
+                            {message.senderFullName || message.senderUsername}
+                          </Typography>
+                        </ChatTruncationTooltip>
                       )}
                       {message.isDeleted ? (
                         renderDeletedMessageNotice(message)
@@ -2976,6 +3478,26 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                   })}
                 </>
               )}
+              </Box>
+              {showJumpToLatest && (
+                <Tooltip title={t("chatWidget.jumpToLatest")} placement="left" slotProps={{ popper: { sx: CHAT_TOOLTIP_POPPER_SX } }}>
+                  <Fab
+                    size="small"
+                    color="primary"
+                    aria-label={t("chatWidget.jumpToLatestAria")}
+                    onClick={handleJumpToLatestClick}
+                    sx={{
+                      position: "absolute",
+                      right: 14,
+                      bottom: 14,
+                      zIndex: 6,
+                      boxShadow: "0 6px 18px rgba(2,6,23,0.22)",
+                    }}
+                  >
+                    <KeyboardArrowDownIcon />
+                  </Fab>
+                </Tooltip>
+              )}
             </Box>
 
             <Box
@@ -3165,7 +3687,11 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
                 }}
                 onPaste={handleComposerPaste}
                 onKeyDown={(e) => {
-                  if (chatMode === "group" && mentionCandidates.length > 0) {
+                  // Only hijack keys when @-mention UI is open (caret after @…); otherwise mentionCandidates
+                  // still lists members with empty query and Enter would wrongly insert a tag instead of sending.
+                  const mentionMenuOpen =
+                    chatMode === "group" && Boolean(mentionAnchorEl) && mentionCandidates.length > 0;
+                  if (mentionMenuOpen) {
                     if (e.key === "ArrowDown") {
                       e.preventDefault();
                       setMentionActiveIndex((prev) => (prev + 1) % mentionCandidates.length);
@@ -3496,10 +4022,12 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
               fullWidth
               sx={{ zIndex: 2700 }}
             >
-              <DialogTitle sx={{ pb: 1 }}>
-                <Typography variant="subtitle2" noWrap>
-                  {mediaPreview.name || t("chatWidget.attachmentLabel")}
-                </Typography>
+              <DialogTitle sx={{ pb: 1, minWidth: 0 }}>
+                <ChatTruncationTooltip title={String(mediaPreview.name || "").trim() || t("chatWidget.attachmentLabel")}>
+                  <Typography variant="subtitle2" component="span">
+                    {mediaPreview.name || t("chatWidget.attachmentLabel")}
+                  </Typography>
+                </ChatTruncationTooltip>
               </DialogTitle>
               <DialogContent sx={{ pt: 0, display: "flex", justifyContent: "center", alignItems: "center" }}>
                 {mediaPreview.type === "image" ? (

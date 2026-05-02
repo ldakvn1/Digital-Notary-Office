@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Box,
@@ -184,7 +185,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
 
   const fetchTemplates = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/templates");
+      const res = await axios.get(API_BASE + "/templates");
       setTemplates(Array.isArray(res.data) ? res.data : []);
     } catch (error) {
       console.error(error);
@@ -195,7 +196,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
     setPreviewWordLoading(true);
     setPreviewWordUrl("");
     try {
-      const { data } = await axios.post("http://localhost:4000/templates/preview-word", {
+      const { data } = await axios.post(API_BASE + "/templates/preview-word", {
         content: form.content || "",
         name: form.name || "template",
         sourceDocxPath: form.sourceDocxPath || null,
@@ -246,7 +247,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
     setLoading(true);
     try {
       if (form.id) {
-        await axios.put(`http://localhost:4000/templates/${form.id}`, {
+        await axios.put(`${API_BASE}/templates/${form.id}`, {
           name: form.name.trim(),
           category: form.category.trim(),
           content: form.content.trim(),
@@ -255,7 +256,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
           useSourceDocx: Boolean(form.useSourceDocx),
         });
       } else {
-        await axios.post("http://localhost:4000/templates", {
+        await axios.post(API_BASE + "/templates", {
           name: form.name.trim(),
           category: form.category.trim(),
           content: form.content.trim(),
@@ -284,7 +285,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
 
   const removeTemplate = async (id) => {
     try {
-      await axios.delete(`http://localhost:4000/templates/${id}`);
+      await axios.delete(`${API_BASE}/templates/${id}`);
       toastApi.success(t("templateManagement.deleteSuccess"));
       fetchTemplates();
     } catch (error) {
@@ -297,7 +298,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
     setVersionHistoryOpen(true);
     setVersionLoading(true);
     try {
-      const res = await axios.get(`http://localhost:4000/templates/${template.id}/versions`);
+      const res = await axios.get(`${API_BASE}/templates/${template.id}/versions`);
       setVersionRows(Array.isArray(res.data) ? res.data : []);
     } catch (error) {
       console.error(error);
@@ -310,7 +311,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
   const restoreTemplateVersion = async (versionId) => {
     if (!versionTemplate?.id) return;
     try {
-      await axios.post(`http://localhost:4000/templates/${versionTemplate.id}/restore/${versionId}`);
+      await axios.post(`${API_BASE}/templates/${versionTemplate.id}/restore/${versionId}`);
       toastApi.success(t("templateManagement.restoreVersionSuccess"));
       await openVersionHistory(versionTemplate);
       fetchTemplates();
@@ -321,7 +322,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
   };
   const updateWorkflow = async (id, action) => {
     try {
-      await axios.post(`http://localhost:4000/templates/${id}/${action}`);
+      await axios.post(`${API_BASE}/templates/${id}/${action}`);
       toastApi.success(t("templateManagement.workflowUpdated"));
       fetchTemplates();
     } catch (error) {
@@ -335,7 +336,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const response = await axios.post("http://localhost:4000/templates/import-content", formData, {
+      const response = await axios.post(API_BASE + "/templates/import-content", formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
       const importedContent = String(response.data?.content || "");
@@ -415,7 +416,7 @@ export default function TemplateManagement({ userRole = "", username = "" }) {
   const closeActionMenu = () => setActionMenu({ anchorEl: null, template: null });
   const handleEditTemplate = async (item) => {
     try {
-      const { data } = await axios.get(`http://localhost:4000/templates/${item.id}`);
+      const { data } = await axios.get(`${API_BASE}/templates/${item.id}`);
       setForm({
         id: data.id,
         name: data.name,

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Button,
@@ -333,7 +334,7 @@ export default function App() {
     if (!isLoggedIn) return;
     const syncCurrentUser = async () => {
       try {
-        const res = await axios.get("http://localhost:4000/me");
+        const res = await axios.get(API_BASE + "/me");
         const nextUser = res?.data || null;
         if (!nextUser) return;
         setUser(nextUser);
@@ -415,7 +416,7 @@ export default function App() {
         ) {
           originalRequest._retry = true;
           try {
-            const refreshRes = await axios.post("http://localhost:4000/auth/refresh", {
+            const refreshRes = await axios.post(API_BASE + "/auth/refresh", {
               refreshToken,
             });
             const newAccessToken = refreshRes.data.accessToken || refreshRes.data.token;
@@ -470,7 +471,7 @@ export default function App() {
     setLoading(true);
     try {
       const includeDeleted = normalizedUserRole === "admin" ? "?includeDeleted=1" : "";
-      const res = await axios.get(`http://localhost:4000/cases${includeDeleted}`);
+      const res = await axios.get(`${API_BASE}/cases${includeDeleted}`);
       setCases(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -482,7 +483,7 @@ export default function App() {
 
   const fetchCustomers = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/customers");
+      const res = await axios.get(API_BASE + "/customers");
       setCustomers(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -492,7 +493,7 @@ export default function App() {
 
   const fetchDashboardStats = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/dashboard/stats");
+      const res = await axios.get(API_BASE + "/dashboard/stats");
       setDashboardStats(res.data || null);
     } catch (err) {
       console.error(err);
@@ -502,7 +503,7 @@ export default function App() {
 
   const fetchNotifications = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/notifications");
+      const res = await axios.get(API_BASE + "/notifications");
       setNotifications(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -515,7 +516,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await axios.get("http://localhost:4000/users");
+      const res = await axios.get(API_BASE + "/users");
       const users = Array.isArray(res.data) ? res.data : [];
       setAssignableUsers(
         users.filter(
@@ -533,7 +534,7 @@ export default function App() {
 
   const markNotificationAsRead = async (notificationId) => {
     try {
-      await axios.post(`http://localhost:4000/notifications/${notificationId}/read`);
+      await axios.post(`${API_BASE}/notifications/${notificationId}/read`);
       setNotifications((prev) =>
         prev.map((item) => (item.id === notificationId ? { ...item, status: "read" } : item))
       );
@@ -555,7 +556,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await axios.get(`http://localhost:4000/cases/${item.caseId}`);
+      const res = await axios.get(`${API_BASE}/cases/${item.caseId}`);
       if (res?.data?.id) {
         setSelectedCase(res.data);
         setOpenModal(true);
@@ -566,7 +567,7 @@ export default function App() {
   };
   const markAllNotificationsAsRead = async () => {
     try {
-      await axios.post("http://localhost:4000/notifications/read-all");
+      await axios.post(API_BASE + "/notifications/read-all");
       setNotifications((prev) => prev.map((item) => ({ ...item, status: "read" })));
     } catch (err) {
       console.error(err);
@@ -575,7 +576,7 @@ export default function App() {
   };
   const clearReadNotifications = async () => {
     try {
-      await axios.delete("http://localhost:4000/notifications/read");
+      await axios.delete(API_BASE + "/notifications/read");
       setNotifications((prev) => prev.filter((item) => item.status !== "read"));
     } catch (err) {
       console.error(err);
@@ -603,7 +604,7 @@ export default function App() {
     setConfirmStatusChange({ open: false, id: null, nextStatus: "", notes: "" });
     setLoading(true);
     try {
-      const { data: updatedCase } = await axios.put(`http://localhost:4000/cases/${id}/status`, {
+      const { data: updatedCase } = await axios.put(`${API_BASE}/cases/${id}/status`, {
         status: nextStatus,
         notes
       });
@@ -691,7 +692,7 @@ export default function App() {
     try {
       let updatedCount = 0;
       try {
-        const res = await axios.put("http://localhost:4000/cases/assign/batch", {
+        const res = await axios.put(API_BASE + "/cases/assign/batch", {
           assignedTo: batchAssignee,
           caseIds: selectedBatchCaseIds,
         });
@@ -703,7 +704,7 @@ export default function App() {
         }
         await Promise.all(
           selectedBatchCaseIds.map((caseId) =>
-            axios.put(`http://localhost:4000/cases/${caseId}/assign`, {
+            axios.put(`${API_BASE}/cases/${caseId}/assign`, {
               assignedTo: batchAssignee,
             })
           )
@@ -974,7 +975,7 @@ export default function App() {
 
   const exportNotaryRegister = async () => {
     try {
-      const response = await axios.get("http://localhost:4000/notary-register/export", {
+      const response = await axios.get(API_BASE + "/notary-register/export", {
         params: { lang: language === "en" ? "en" : "vi" },
         responseType: "blob",
       });
@@ -1001,7 +1002,7 @@ export default function App() {
 
   const exportEnterpriseReport = async (type) => {
     try {
-      const response = await axios.get("http://localhost:4000/reports/enterprise/export", {
+      const response = await axios.get(API_BASE + "/reports/enterprise/export", {
         params: { type, lang: language === "en" ? "en" : "vi" },
         responseType: "blob",
       });
@@ -1037,7 +1038,7 @@ export default function App() {
     const refreshToken = localStorage.getItem("refreshToken");
     if (refreshToken) {
       try {
-        await axios.post("http://localhost:4000/auth/logout", { refreshToken });
+        await axios.post(API_BASE + "/auth/logout", { refreshToken });
       } catch (error) {
         console.error(error);
       }

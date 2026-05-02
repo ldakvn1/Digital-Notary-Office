@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { API_BASE } from "./apiBase";
 import {
   Box,
   Paper,
@@ -118,7 +119,7 @@ export default function CustomerManagement({ currentUser, focusCustomerId = null
   const fetchCustomers = async () => {
     setLoading(true);
     try {
-      const res = await axios.get("http://localhost:4000/customers");
+      const res = await axios.get(API_BASE + "/customers");
       setCustomers(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -286,11 +287,11 @@ export default function CustomerManagement({ currentUser, focusCustomerId = null
       }
       if (editingId) {
         // Update existing customer
-        await axios.put(`http://localhost:4000/customers/${editingId}`, payload);
+        await axios.put(`${API_BASE}/customers/${editingId}`, payload);
         toastApi.success(t("customers.saveSuccess"));
       } else {
         // Create new customer
-        await axios.post("http://localhost:4000/customers", payload);
+        await axios.post(API_BASE + "/customers", payload);
         toastApi.success(t("customers.saveSuccess"));
       }
       fetchCustomers();
@@ -323,7 +324,7 @@ export default function CustomerManagement({ currentUser, focusCustomerId = null
     formData.append("file", cccdFile);
     setOcrLoading(true);
     try {
-      const res = await axios.post("http://localhost:4000/ocr/cccd", formData);
+      const res = await axios.post(API_BASE + "/ocr/cccd", formData);
       const extracted = res.data?.data || {};
       if (extracted.fullName) setFullName(extracted.fullName);
       if (extracted.idNumber) setIdNumber(extracted.idNumber);
@@ -345,7 +346,7 @@ export default function CustomerManagement({ currentUser, focusCustomerId = null
     setConfirmDeleteId(null);
     setLoading(true);
     try {
-      await axios.delete(`http://localhost:4000/customers/${id}`);
+      await axios.delete(`${API_BASE}/customers/${id}`);
       toastApi.success(t("customers.deleteSuccess"));
       fetchCustomers();
     } catch (err) {

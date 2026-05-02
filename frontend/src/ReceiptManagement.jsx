@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Box,
@@ -136,7 +137,7 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
       return;
     }
     try {
-      await axios.put(`http://localhost:4000/cases/${Number(form.caseId)}/fee`, {
+      await axios.put(`${API_BASE}/cases/${Number(form.caseId)}/fee`, {
         feeAmount: totalCostValue,
       });
       toastApi?.success?.("Đã cập nhật Tổng chi phí của hồ sơ.");
@@ -170,7 +171,7 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
       const params = new URLSearchParams();
       if (caseIdFilter) params.set("caseId", caseIdFilter);
       const suffix = params.toString() ? `?${params.toString()}` : "";
-      const res = await axios.get(`http://localhost:4000/receipts${suffix}`);
+      const res = await axios.get(`${API_BASE}/receipts${suffix}`);
       setReceipts(Array.isArray(res.data) ? res.data : []);
     } catch (error) {
       console.error(error);
@@ -248,7 +249,7 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
         return;
       }
       if (totalCostValue > 0 && totalCostValue !== currentCaseFeeAmount) {
-        await axios.put(`http://localhost:4000/cases/${Number(form.caseId)}/fee`, {
+        await axios.put(`${API_BASE}/cases/${Number(form.caseId)}/fee`, {
           feeAmount: totalCostValue,
         });
       }
@@ -264,10 +265,10 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
         note: form.note || "",
       };
       if (editingReceiptId) {
-        await axios.put(`http://localhost:4000/receipts/${editingReceiptId}`, payload);
+        await axios.put(`${API_BASE}/receipts/${editingReceiptId}`, payload);
         toastApi?.success?.(t("receipts.updateSuccess"));
       } else {
-        await axios.post("http://localhost:4000/receipts", payload);
+        await axios.post(API_BASE + "/receipts", payload);
         toastApi?.success?.(t("receipts.createSuccess"));
       }
       setForm((prev) => ({ ...prev, amount: "", receiptNo: "", note: "" }));
@@ -291,7 +292,7 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
   const deleteReceipt = async () => {
     if (!confirmDeleteId) return;
     try {
-      await axios.delete(`http://localhost:4000/receipts/${confirmDeleteId}`);
+      await axios.delete(`${API_BASE}/receipts/${confirmDeleteId}`);
       toastApi?.success?.(t("receipts.deleteSuccess"));
       setConfirmDeleteId(null);
       if (editingReceiptId === confirmDeleteId) {
@@ -306,7 +307,7 @@ export default function ReceiptManagement({ cases = [], focusCaseId = null, onFo
   };
   const exportReceiptReport = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/receipts/export", {
+      const res = await axios.get(API_BASE + "/receipts/export", {
         params: { lang: language === "en" ? "en" : "vi" },
         responseType: "blob",
       });

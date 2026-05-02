@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Avatar,
@@ -26,7 +27,7 @@ export default function InternalChat({ currentUser, toastApi }) {
   const loadMessages = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const res = await axios.get("http://localhost:4000/chat/messages", {
+      const res = await axios.get(API_BASE + "/chat/messages", {
         params: { limit: 100 },
       });
       setMessages(Array.isArray(res.data) ? res.data : []);
@@ -65,7 +66,7 @@ export default function InternalChat({ currentUser, toastApi }) {
     if (!content || sending) return;
     setSending(true);
     try {
-      const res = await axios.post("http://localhost:4000/chat/messages", { content });
+      const res = await axios.post(API_BASE + "/chat/messages", { content });
       setMessages((prev) => [...prev, res.data]);
       setDraft("");
     } catch (error) {

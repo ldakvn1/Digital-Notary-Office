@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { API_BASE } from "./apiBase";
 import {
   Box,
   Chip,
@@ -127,7 +128,7 @@ export default function UserManagement({ currentUser }) {
 
   const fetchUsers = useCallback(async () => {
     try {
-      const res = await axios.get("http://localhost:4000/users");
+      const res = await axios.get(API_BASE + "/users");
       setUsers(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
       console.error(err);
@@ -236,7 +237,7 @@ export default function UserManagement({ currentUser }) {
       setAvatarUploading(true);
       const formData = new FormData();
       formData.append("avatar", file);
-      const res = await axios.post("http://localhost:4000/users/avatar-upload", formData, {
+      const res = await axios.post(API_BASE + "/users/avatar-upload", formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
       setAvatarUrl(res.data?.avatarUrl || "");
@@ -273,7 +274,7 @@ export default function UserManagement({ currentUser }) {
           setFormError("Mật khẩu mới phải có ít nhất 8 ký tự.");
           return;
         }
-        await axios.put(`http://localhost:4000/users/${editingUser}`, {
+        await axios.put(`${API_BASE}/users/${editingUser}`, {
           role,
           password: password || undefined,
           fullName: fullName || undefined,
@@ -287,7 +288,7 @@ export default function UserManagement({ currentUser }) {
           setFormError("Vui lòng nhập email để gửi tài khoản.");
           return;
         }
-        const createRes = await axios.post("http://localhost:4000/users", {
+        const createRes = await axios.post(API_BASE + "/users", {
           username: normalizedUsername,
           fullName: fullName || undefined,
           email: email.trim(),
@@ -356,7 +357,7 @@ export default function UserManagement({ currentUser }) {
     const usernameToDelete = confirmDelete.username;
     setConfirmDelete({ open: false, username: "" });
     try {
-      await axios.delete(`http://localhost:4000/users/${usernameToDelete}`);
+      await axios.delete(`${API_BASE}/users/${usernameToDelete}`);
       fetchUsers();
       toastApi.success(t("users.deleteSuccess"));
     } catch (err) {
@@ -375,7 +376,7 @@ export default function UserManagement({ currentUser }) {
 
   const handleUnlockLogin = async (usernameToUnlock) => {
     try {
-      await axios.post(`http://localhost:4000/users/${usernameToUnlock}/unlock-login`);
+      await axios.post(`${API_BASE}/users/${usernameToUnlock}/unlock-login`);
       toastApi.success("Đã mở khóa đăng nhập cho user.");
       fetchUsers();
     } catch (err) {
@@ -386,7 +387,7 @@ export default function UserManagement({ currentUser }) {
 
   const handleReissueInitialPassword = async (usernameTarget) => {
     try {
-      const res = await axios.post(`http://localhost:4000/users/${usernameTarget}/reissue-initial-password`);
+      const res = await axios.post(`${API_BASE}/users/${usernameTarget}/reissue-initial-password`);
       if (res.data?.emailSent) {
         toastApi.success("Đã cấp lại mật khẩu tạm và gửi email.");
       } else {
@@ -403,7 +404,7 @@ export default function UserManagement({ currentUser }) {
   const handleReissueInitialPasswordNoEmail = async (usernameTarget) => {
     try {
       const res = await axios.post(
-        `http://localhost:4000/users/${usernameTarget}/reissue-initial-password-no-email`
+        `${API_BASE}/users/${usernameTarget}/reissue-initial-password-no-email`
       );
       toastApi.warning(
         `Đã cấp mật khẩu tạm cho user (không email). Mật khẩu tạm: ${res.data?.temporaryPassword}`
@@ -423,7 +424,7 @@ export default function UserManagement({ currentUser }) {
       return;
     }
     try {
-      await axios.put(`http://localhost:4000/users/${userRow.username}`, {
+      await axios.put(`${API_BASE}/users/${userRow.username}`, {
         isActive: !userRow.isActive,
       });
       setUsers((prev) =>
@@ -532,7 +533,7 @@ export default function UserManagement({ currentUser }) {
       if (auditTo) params.set("to", new Date(`${auditTo}T23:59:59`).toISOString());
       if (auditSearch.trim()) params.set("search", auditSearch.trim());
       const res = await axios.get(
-        `http://localhost:4000/admin/audit-logs?${params.toString()}`
+        `${API_BASE}/admin/audit-logs?${params.toString()}`
       );
       setSecurityLogs(Array.isArray(res.data) ? res.data : []);
       setSecurityLogsOpen(true);
@@ -551,7 +552,7 @@ export default function UserManagement({ currentUser }) {
       if (auditTo) params.set("to", new Date(`${auditTo}T23:59:59`).toISOString());
       if (auditSearch.trim()) params.set("search", auditSearch.trim());
       const res = await axios.get(
-        `http://localhost:4000/admin/audit-logs/export?${params.toString()}`,
+        `${API_BASE}/admin/audit-logs/export?${params.toString()}`,
         { responseType: "blob" }
       );
       const hash = res.headers["x-content-sha256"];

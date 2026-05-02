@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Avatar,
@@ -81,7 +82,7 @@ export default function Login({ onLogin }) {
     };
     if (!validateRequiredFields()) return;
     try {
-      const res = await axios.post("http://localhost:4000/login", {
+      const res = await axios.post(API_BASE + "/login", {
         username,
         password,
         captchaToken: captchaToken || undefined,
@@ -144,7 +145,7 @@ export default function Login({ onLogin }) {
     }
     setForgotLoading(true);
     try {
-      const res = await axios.post("http://localhost:4000/auth/forgot-password", {
+      const res = await axios.post(API_BASE + "/auth/forgot-password", {
         email: forgotEmail.trim(),
       });
       toastApi.success(
@@ -169,7 +170,7 @@ export default function Login({ onLogin }) {
       return;
     }
     try {
-      await axios.post("http://localhost:4000/auth/initial-password-change", {
+      await axios.post(API_BASE + "/auth/initial-password-change", {
         username,
         currentPassword: password,
         newPassword: initialNewPassword,
