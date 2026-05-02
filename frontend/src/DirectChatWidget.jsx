@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { API_BASE } from "./apiBase";
 import axios from "axios";
 import {
   Autocomplete,
@@ -676,7 +677,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
 
   const loadUsers = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/chat/conversations");
+      const res = await axios.get(API_BASE + "/chat/conversations");
       const list = Array.isArray(res.data) ? res.data : [];
       setUsers(list);
       if (!selectedUsername && list.length > 0) {
@@ -696,7 +697,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
   };
   const loadDirectoryUsers = async () => {
     try {
-      const res = await axios.get("http://localhost:4000/chat/users");
+      const res = await axios.get(API_BASE + "/chat/users");
       const list = Array.isArray(res.data) ? res.data : [];
       setDirectoryUsers(
         list.map((item) => ({
@@ -712,7 +713,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
   const loadGroups = async () => {
     setLoadingGroups(true);
     try {
-      const res = await axios.get("http://localhost:4000/chat/groups");
+      const res = await axios.get(API_BASE + "/chat/groups");
       const list = Array.isArray(res.data) ? res.data : [];
       setGroups(list);
       if (!selectedGroupId && list.length > 0) {
@@ -729,7 +730,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!groupId) return;
     if (!silent) setLoadingMessages(true);
     try {
-      const res = await axios.get(`http://localhost:4000/chat/groups/${Number(groupId)}/messages`, {
+      const res = await axios.get(`${API_BASE}/chat/groups/${Number(groupId)}/messages`, {
         params: { limit: 120 },
       });
       const list = Array.isArray(res.data) ? res.data : [];
@@ -745,7 +746,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!username) return;
     if (!silent) setLoadingMessages(true);
     try {
-      const res = await axios.get(`http://localhost:4000/chat/direct/${encodeURIComponent(username)}`, {
+      const res = await axios.get(`${API_BASE}/chat/direct/${encodeURIComponent(username)}`, {
         params: { limit: 100 },
       });
       const nextMessages = Array.isArray(res.data) ? res.data : [];
@@ -773,7 +774,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     setLoadingMore(true);
     try {
       const firstId = Number(messages[0]?.id || 0);
-      const res = await axios.get(`http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}`, {
+      const res = await axios.get(`${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}`, {
         params: { limit: 50, beforeId: firstId },
       });
       const older = Array.isArray(res.data) ? res.data : [];
@@ -792,15 +793,15 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
 
   useEffect(() => {
     if (!currentUser?.username) return;
-    axios.post("http://localhost:4000/chat/presence").catch(() => {});
+    axios.post(API_BASE + "/chat/presence").catch(() => {});
     const safeStatus = normalizeStatus(myChatStatus);
     if (safeStatus) {
-      axios.patch("http://localhost:4000/chat/presence/status", { status: safeStatus }).catch(() => {});
+      axios.patch(API_BASE + "/chat/presence/status", { status: safeStatus }).catch(() => {});
     }
     loadUsers();
     loadGroups();
     const timer = setInterval(() => {
-      axios.post("http://localhost:4000/chat/presence").catch(() => {});
+      axios.post(API_BASE + "/chat/presence").catch(() => {});
       loadUsers();
       loadGroups();
       if (open && chatMode === "direct" && selectedUsername) {
@@ -830,7 +831,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     let cancelled = false;
     const timer = setTimeout(() => {
       axios
-        .get("http://localhost:4000/chat/search/direct", {
+        .get(API_BASE + "/chat/search/direct", {
           params: { q, limit: 80 },
         })
         .then((res) => {
@@ -861,7 +862,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!currentUser?.username) return;
     const token = localStorage.getItem("token");
     if (!token) return;
-    const socket = io("http://localhost:4000", {
+    const socket = io(API_BASE, {
       auth: { token },
       transports: ["websocket", "polling"],
     });
@@ -1067,9 +1068,9 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (readSyncTimerRef.current) clearTimeout(readSyncTimerRef.current);
     readSyncTimerRef.current = setTimeout(() => {
       if (chatMode === "group" && selectedGroupId) {
-        axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroupId)}/read`).catch(() => {});
+        axios.post(`${API_BASE}/chat/groups/${Number(selectedGroupId)}/read`).catch(() => {});
       } else if (chatMode === "direct" && selectedUsername) {
-        axios.post(`http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}/read`).catch(() => {});
+        axios.post(`${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}/read`).catch(() => {});
       }
     }, 700);
     return () => {
@@ -1081,7 +1082,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!open || !selectedUsername || socketConnected) return;
     const loadTyping = () =>
       axios
-        .get(`http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}/typing`)
+        .get(`${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}/typing`)
         .then((res) => setPeerTyping(Boolean(res?.data?.peerTyping)))
         .catch(() => {});
     loadTyping();
@@ -1095,14 +1096,38 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (typing === typingActiveRef.current) return;
     typingActiveRef.current = typing;
     axios
-      .post(`http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}/typing`, { typing })
+      .post(`${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}/typing`, { typing })
       .catch(() => {});
   };
 
   useEffect(() => {
-    if (!messageListRef.current) return;
-    messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
-  }, [messages.length, groupMessages.length, open, selectedUsername, selectedGroupId, chatMode]);
+    if (!open || loadingMessages) return;
+    const el = messageListRef.current;
+    if (!el) return;
+    const scrollToEnd = () => {
+      el.scrollTop = el.scrollHeight;
+    };
+    scrollToEnd();
+    const raf = requestAnimationFrame(() => {
+      scrollToEnd();
+      requestAnimationFrame(scrollToEnd);
+    });
+    const t0 = setTimeout(scrollToEnd, 0);
+    const t1 = setTimeout(scrollToEnd, 80);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t0);
+      clearTimeout(t1);
+    };
+  }, [
+    open,
+    loadingMessages,
+    chatMode,
+    selectedUsername,
+    selectedGroupId,
+    messages.length,
+    groupMessages.length,
+  ]);
   useEffect(() => {
     setGroupSearchIndex(0);
   }, [groupMessageSearch, selectedGroupId, chatMode]);
@@ -1124,7 +1149,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
         await sendAttachmentFile(nextFile, nextCaption);
       } else if (outboundContent) {
         if (chatMode === "group" && selectedGroupId) {
-          const res = await axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroupId)}/messages`, {
+          const res = await axios.post(`${API_BASE}/chat/groups/${Number(selectedGroupId)}/messages`, {
             content: outboundContent,
             ...(replyingTo?.id ? { replyToId: replyingTo.id } : {}),
           });
@@ -1135,8 +1160,8 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
         } else {
           const res =
             editingMessageId !== null
-              ? await axios.patch(`http://localhost:4000/chat/direct/messages/${editingMessageId}`, { content: outboundContent })
-              : await axios.post(`http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}`, {
+              ? await axios.patch(`${API_BASE}/chat/direct/messages/${editingMessageId}`, { content: outboundContent })
+              : await axios.post(`${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}`, {
                   content: outboundContent,
                   ...(replyingTo?.id ? { replyToId: replyingTo.id } : {}),
                 });
@@ -1168,7 +1193,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
 
   const handleDeleteMessage = async (messageId) => {
     try {
-      const res = await axios.delete(`http://localhost:4000/chat/direct/messages/${messageId}`);
+      const res = await axios.delete(`${API_BASE}/chat/direct/messages/${messageId}`);
       setMessages((prev) =>
         prev.map((item) => (Number(item.id) === Number(messageId) ? { ...item, ...(res.data || {}) } : item))
       );
@@ -1182,7 +1207,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const groupId = Number(groupIdInput || 0);
     if (!groupId || !messageId) return;
     try {
-      const res = await axios.delete(`http://localhost:4000/chat/groups/${groupId}/messages/${Number(messageId)}`);
+      const res = await axios.delete(`${API_BASE}/chat/groups/${groupId}/messages/${Number(messageId)}`);
       setGroupMessages((prev) =>
         prev.map((item) => (Number(item.id) === Number(messageId) ? { ...item, ...(res.data || {}) } : item))
       );
@@ -1207,7 +1232,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const username = String(usernameInput || "").trim();
     if (!username) return;
     try {
-      await axios.post(`http://localhost:4000/chat/direct/${encodeURIComponent(username)}/read`);
+      await axios.post(`${API_BASE}/chat/direct/${encodeURIComponent(username)}/read`);
       setUsers((prev) => prev.map((item) => (item.username === username ? { ...item, unreadCount: 0 } : item)));
     } catch (error) {
       console.error(error);
@@ -1217,7 +1242,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const groupId = Number(groupIdInput || 0);
     if (!groupId) return;
     try {
-      await axios.post(`http://localhost:4000/chat/groups/${groupId}/read`);
+      await axios.post(`${API_BASE}/chat/groups/${groupId}/read`);
       setGroups((prev) =>
         prev.map((item) =>
           Number(item.id) === groupId
@@ -1245,7 +1270,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const username = String(usernameInput || "").trim();
     if (!username) return;
     try {
-      await axios.delete(`http://localhost:4000/chat/direct/${encodeURIComponent(username)}/conversation`);
+      await axios.delete(`${API_BASE}/chat/direct/${encodeURIComponent(username)}/conversation`);
       if (String(selectedUsernameRef.current || "") === username) {
         setMessages([]);
         setSelectedUsername("");
@@ -1273,7 +1298,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!groupId) return;
     setGroupManaging(true);
     try {
-      await axios.delete(`http://localhost:4000/chat/groups/${groupId}`);
+      await axios.delete(`${API_BASE}/chat/groups/${groupId}`);
       if (Number(selectedGroupId || 0) === groupId) {
         setSelectedGroupId(null);
         setGroupMessages([]);
@@ -1320,8 +1345,8 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       }
       const endpoint =
         chatMode === "group"
-          ? `http://localhost:4000/chat/groups/${Number(selectedGroupId)}/attachment`
-          : `http://localhost:4000/chat/direct/${encodeURIComponent(selectedUsername)}/attachment`;
+          ? `${API_BASE}/chat/groups/${Number(selectedGroupId)}/attachment`
+          : `${API_BASE}/chat/direct/${encodeURIComponent(selectedUsername)}/attachment`;
       const res = await axios.post(endpoint, formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
@@ -1470,7 +1495,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const raw = String(message?.attachmentUrl || "").trim();
     if (!raw) return "";
     if (/^https?:\/\//i.test(raw)) return raw;
-    return `http://localhost:4000/uploads/${encodeURIComponent(raw)}`;
+    return `${API_BASE}/uploads/${encodeURIComponent(raw)}`;
   };
   const isImageAttachment = (message) => String(message?.attachmentMime || "").toLowerCase().startsWith("image/");
   const isVideoAttachment = (message) => String(message?.attachmentMime || "").toLowerCase().startsWith("video/");
@@ -1494,8 +1519,8 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       const effectiveGroupId = Number(context.groupId || selectedGroupId || 0);
       const downloadUrl =
         effectiveMode === "group"
-          ? `http://localhost:4000/chat/groups/${effectiveGroupId}/messages/${message.id}/download`
-          : `http://localhost:4000/chat/direct/messages/${message.id}/download`;
+          ? `${API_BASE}/chat/groups/${effectiveGroupId}/messages/${message.id}/download`
+          : `${API_BASE}/chat/direct/messages/${message.id}/download`;
       const res = await axios.get(downloadUrl, {
         responseType: "blob",
       });
@@ -1582,7 +1607,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
         const groupId = Number(selectedGroupId || message.groupId || 0);
         if (!groupId) return;
         const res = await axios.post(
-          `http://localhost:4000/chat/groups/${groupId}/messages/${Number(message.id)}/reactions`,
+          `${API_BASE}/chat/groups/${groupId}/messages/${Number(message.id)}/reactions`,
           { emoji }
         );
         const next = res?.data?.reactions || {};
@@ -1590,7 +1615,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
           prev.map((item) => (Number(item.id) === Number(message.id) ? { ...item, reactions: next } : item))
         );
       } else {
-        const res = await axios.post(`http://localhost:4000/chat/direct/messages/${Number(message.id)}/reactions`, { emoji });
+        const res = await axios.post(`${API_BASE}/chat/direct/messages/${Number(message.id)}/reactions`, { emoji });
         const next = res?.data?.reactions || {};
         setMessages((prev) =>
           prev.map((item) => (Number(item.id) === Number(message.id) ? { ...item, reactions: next } : item))
@@ -1780,7 +1805,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     const status = normalizeStatus(statusRaw);
     if (!status) return;
     try {
-      await axios.patch("http://localhost:4000/chat/presence/status", { status });
+      await axios.patch(API_BASE + "/chat/presence/status", { status });
       setMyChatStatus(status);
     } catch (error) {
       console.error(error);
@@ -1823,7 +1848,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     }
     setCreatingGroup(true);
     try {
-      const res = await axios.post("http://localhost:4000/chat/groups", {
+      const res = await axios.post(API_BASE + "/chat/groups", {
         name,
         memberUsernames: groupMemberUsernames,
       });
@@ -1860,7 +1885,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!name) return;
     setGroupManaging(true);
     try {
-      await axios.patch(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}`, { name });
+      await axios.patch(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}`, { name });
       await loadGroups();
       toastApi?.success(t("chatWidget.groupRenameSuccess"));
     } catch (error) {
@@ -1881,7 +1906,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
       for (const username of usernames) {
         // Sequential add to preserve existing backend validation behavior and clear errors.
         // eslint-disable-next-line no-await-in-loop
-        await axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/members`, { username });
+        await axios.post(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/members`, { username });
       }
       setGroupAddMemberSelections([]);
       await loadGroups();
@@ -1897,7 +1922,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!selectedGroup || !username) return;
     setGroupManaging(true);
     try {
-      await axios.delete(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/members/${encodeURIComponent(username)}`);
+      await axios.delete(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/members/${encodeURIComponent(username)}`);
       await loadGroups();
       toastApi?.success(t("chatWidget.groupRemoveMemberSuccess"));
     } catch (error) {
@@ -1911,7 +1936,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!selectedGroup || !username) return;
     setGroupManaging(true);
     try {
-      await axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/admins`, { username });
+      await axios.post(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/admins`, { username });
       await loadGroups();
       toastApi?.success(t("chatWidget.groupPromoteAdminSuccess"));
     } catch (error) {
@@ -1925,7 +1950,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!selectedGroup || !username) return;
     setGroupManaging(true);
     try {
-      await axios.delete(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/admins/${encodeURIComponent(username)}`);
+      await axios.delete(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/admins/${encodeURIComponent(username)}`);
       await loadGroups();
       toastApi?.success(t("chatWidget.groupDemoteAdminSuccess"));
     } catch (error) {
@@ -1939,7 +1964,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!selectedGroup || !username || !canTransferSelectedGroupOwner) return;
     setGroupManaging(true);
     try {
-      await axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/transfer-owner`, { username });
+      await axios.post(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/transfer-owner`, { username });
       await loadGroups();
       toastApi?.success(t("chatWidget.groupTransferOwnerSuccess"));
     } catch (error) {
@@ -1953,7 +1978,7 @@ export default function DirectChatWidget({ currentUser, toastApi }) {
     if (!selectedGroup) return;
     setGroupManaging(true);
     try {
-      await axios.post(`http://localhost:4000/chat/groups/${Number(selectedGroup.id)}/leave`);
+      await axios.post(`${API_BASE}/chat/groups/${Number(selectedGroup.id)}/leave`);
       setGroupSettingsOpen(false);
       setSelectedGroupId(null);
       await loadGroups();
