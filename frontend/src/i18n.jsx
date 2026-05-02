@@ -48,7 +48,7 @@ const dictionaries = {
       chat: "💬 Chat nội bộ",
       users: "👤 Quản lý người dùng",
       profile: "Hồ sơ cá nhân",
-      templates: "📝 Biểu mẫu",
+      templates: "📝 Quản lý Biểu mẫu",
       translators: "🌐 Cộng tác viên dịch",
     },
     chat: {
