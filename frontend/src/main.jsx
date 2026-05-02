@@ -1,6 +1,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createTheme, CssBaseline, ThemeProvider } from "@mui/material";
+import "./axiosAuthBootstrap.js";
 import "./index.css";
 import App from "./App.jsx";
 import ChatPopout from "./ChatPopout.jsx";

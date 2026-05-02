@@ -27,8 +27,6 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useI18n } from "./i18n";
 import { FILE_TYPES } from "./constants/fileTypes";
 
-const Transition = Slide;
-
 export default function CreateCaseDialog({ open, onClose, customers, onCreated, toastApi }) {
   const { t } = useI18n();
   const [step, setStep] = useState("form");
@@ -273,7 +271,13 @@ export default function CreateCaseDialog({ open, onClose, customers, onCreated, 
   };
 
   return (
-    <Dialog fullScreen open={open} onClose={handleClose} TransitionComponent={Transition}>
+    <Dialog
+      fullScreen
+      open={open}
+      onClose={handleClose}
+      slots={{ transition: Slide }}
+      slotProps={{ transition: { direction: "up" } }}
+    >
       <AppBar sx={{ position: "relative" }}>
         <Toolbar>
           <IconButton edge="start" color="inherit" onClick={handleClose} aria-label="close">

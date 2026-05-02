@@ -1,18 +1,13 @@
 import { useEffect, useState } from "react";
-import axios from "axios";
 import { Box, Button, Stack, Typography } from "@mui/material";
 import DirectChatWidget from "./DirectChatWidget";
+import { mergeUserIdFromToken } from "./authToken";
 import { ToastHost, useToastQueue } from "./toast";
 import { useI18n } from "./i18n";
+import { syncAxiosAuthFromStorage } from "./axiosAuthBootstrap";
 
-function applyAuthFromStorage() {
-  const token = localStorage.getItem("token");
-  if (token) {
-    axios.defaults.headers.common.Authorization = `Bearer ${token}`;
-  } else {
-    delete axios.defaults.headers.common.Authorization;
-  }
-}
+const DNO_CHAT_POPOUT_ACTIVE_KEY = "dno_chat_popout_active";
+const DNO_CHAT_POPOUT_HEARTBEAT_MS = 3000;
 
 export default function ChatPopout() {
   const { t } = useI18n();
@@ -21,10 +16,17 @@ export default function ChatPopout() {
   const [authChecked, setAuthChecked] = useState(false);
 
   useEffect(() => {
-    applyAuthFromStorage();
+    syncAxiosAuthFromStorage();
     try {
       const raw = localStorage.getItem("user");
-      setUser(raw ? JSON.parse(raw) : null);
+      const token = localStorage.getItem("token");
+      if (!raw) {
+        setUser(null);
+      } else {
+        const merged = mergeUserIdFromToken(JSON.parse(raw), token);
+        setUser(merged);
+        if (merged?.id) localStorage.setItem("user", JSON.stringify(merged));
+      }
     } catch {
       setUser(null);
     }
@@ -43,6 +45,39 @@ export default function ChatPopout() {
   }, [authChecked, user, t]);
 
   const hasSession = Boolean(localStorage.getItem("token") && user);
+
+  useEffect(() => {
+    if (!hasSession) return undefined;
+    let heartbeat = null;
+    const clear = () => {
+      try {
+        localStorage.removeItem(DNO_CHAT_POPOUT_ACTIVE_KEY);
+      } catch (_e) {
+        /* ignore */
+      }
+    };
+    const touch = () => {
+      try {
+        localStorage.setItem(DNO_CHAT_POPOUT_ACTIVE_KEY, String(Date.now()));
+      } catch (_e2) {
+        /* ignore */
+      }
+    };
+    try {
+      touch();
+      heartbeat = window.setInterval(touch, DNO_CHAT_POPOUT_HEARTBEAT_MS);
+    } catch (_e2) {
+      /* ignore */
+    }
+    window.addEventListener("beforeunload", clear);
+    window.addEventListener("pagehide", clear);
+    return () => {
+      window.removeEventListener("beforeunload", clear);
+      window.removeEventListener("pagehide", clear);
+      if (heartbeat != null) window.clearInterval(heartbeat);
+      clear();
+    };
+  }, [hasSession]);
 
   return (
     <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
@@ -72,7 +107,12 @@ export default function ChatPopout() {
         </Box>
       ) : (
         <Box sx={{ height: "100vh", width: "100vw", overflow: "hidden" }}>
-          <DirectChatWidget currentUser={user} toastApi={toastApi} isPopout />
+          <DirectChatWidget
+            currentUser={user}
+            toastApi={toastApi}
+            isPopout
+            defaultCallVideoEnabled={import.meta.env.PROD}
+          />
         </Box>
       )}
       <ToastHost toast={toast} onClose={closeToast} />

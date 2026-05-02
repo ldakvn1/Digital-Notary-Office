@@ -1,10 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Box, LinearProgress, Slide, Snackbar, Typography } from "@mui/material";
 
-function SlideLeftTransition(props) {
-  return <Slide {...props} direction="left" />;
-}
-
 export function useToastQueue(defaultAutoHideMs = 3200) {
   const [queue, setQueue] = useState([]);
   const dedupeRef = useRef(new Map());
@@ -70,7 +66,8 @@ export function ToastHost({ toast, onClose }) {
       autoHideDuration={duration}
       onClose={onClose}
       anchorOrigin={{ vertical: "top", horizontal: "right" }}
-      TransitionComponent={SlideLeftTransition}
+      slots={{ transition: Slide }}
+      slotProps={{ transition: { direction: "left" } }}
     >
       <Alert
         severity={toast?.severity || "info"}

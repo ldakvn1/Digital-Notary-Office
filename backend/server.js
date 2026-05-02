@@ -14,6 +14,7 @@ const htmlDocx = require("html-docx-js");
 const nodemailer = require("nodemailer");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+const os = require("os");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { body, param, query, validationResult } = require("express-validator");
@@ -1101,7 +1102,7 @@ async function ensurePasswordHashed(user, plainTextPassword) {
 async function createAuthSession(user) {
   const sessionId = crypto.randomUUID();
   const accessToken = jwt.sign(
-    { username: user.username, role: user.role, type: "access", sessionId },
+    { username: user.username, role: user.role, type: "access", sessionId, id: user.id },
     ACCESS_TOKEN_SECRET,
     { expiresIn: ACCESS_TOKEN_TTL }
   );
@@ -1889,11 +1890,12 @@ const authenticateToken = async (req, res, next) => {
     }
     const session = await prisma.session.findUnique({
       where: { sessionId: decoded.sessionId },
+      select: { revokedAt: true, expiresAt: true, userId: true },
     });
     if (!session || session.revokedAt || session.expiresAt < new Date()) {
       return res.status(403).send("Session expired");
     }
-    req.user = decoded;
+    req.user = { ...decoded, id: session.userId };
     next();
   } catch (err) {
     return res.status(403).send("Invalid token");
@@ -1927,6 +1929,10 @@ io.use(async (socket, next) => {
     return next(new Error("Invalid token"));
   }
 });
+
+/** WebRTC call signaling (Phase 1): in-memory sessions, relayed via emitToUser. */
+const WEBRTC_CALL_MAX_GROUP_PEERS = 6;
+const activeCalls = new Map();
 
 io.on("connection", (socket) => {
   const actor = socket.data.user;
@@ -1962,7 +1968,213 @@ io.on("connection", (socket) => {
     } catch (_error) {}
   });
 
+  socket.on("call:invite", async (raw) => {
+    try {
+      const callId = String(raw?.callId || "").trim();
+      const mode = raw?.mode === "group" ? "group" : "direct";
+      if (!callId) return socket.emit("call:error", { message: "missing_call_id" });
+      if (activeCalls.has(callId)) return socket.emit("call:error", { message: "call_exists" });
+
+      const media = {
+        audio: raw?.media?.audio !== false,
+        video: Boolean(raw?.media?.video),
+      };
+
+      if (mode === "direct") {
+        const targetUserId = Number(raw?.targetUserId);
+        if (!targetUserId || targetUserId === Number(actor.id)) {
+          return socket.emit("call:error", { message: "invalid_target" });
+        }
+        const peer = await prisma.user.findUnique({ where: { id: targetUserId } });
+        if (!peer || peer.isActive === false) return socket.emit("call:error", { message: "peer_not_found" });
+        if (!isUserOnlineBySocket(targetUserId)) {
+          return socket.emit("call:error", { message: "peer_offline" });
+        }
+
+        activeCalls.set(callId, {
+          state: "ringing",
+          mode: "direct",
+          callerId: Number(actor.id),
+          participantIds: new Set([Number(actor.id), targetUserId]),
+          answeredIds: new Set([Number(actor.id)]),
+          groupId: null,
+          media,
+        });
+
+        emitToUser(targetUserId, "call:invite:recv", {
+          callId,
+          fromUser: { id: actor.id, username: actor.username },
+          mode: "direct",
+          groupId: null,
+          media,
+        });
+        socket.emit("call:invite:sent", { callId, mode: "direct" });
+        return;
+      }
+
+      const groupId = Number(raw?.groupId);
+      if (!groupId) return socket.emit("call:error", { message: "missing_group" });
+      const membership = await prisma.groupChatMember.findUnique({
+        where: { groupId_userId: { groupId, userId: actor.id } },
+      });
+      if (!membership) return socket.emit("call:error", { message: "not_group_member" });
+
+      const members = await prisma.groupChatMember.findMany({
+        where: { groupId },
+        select: { userId: true },
+      });
+      let memberIds = members.map((m) => Number(m.userId)).filter((id) => id !== Number(actor.id));
+      if (memberIds.length > WEBRTC_CALL_MAX_GROUP_PEERS - 1) {
+        memberIds = memberIds.slice(0, WEBRTC_CALL_MAX_GROUP_PEERS - 1);
+      }
+      const participantIds = new Set([Number(actor.id), ...memberIds]);
+      activeCalls.set(callId, {
+        state: "ringing",
+        mode: "group",
+        callerId: Number(actor.id),
+        participantIds,
+        answeredIds: new Set([Number(actor.id)]),
+        groupId,
+        media,
+      });
+      for (const uid of memberIds) {
+        emitToUser(uid, "call:invite:recv", {
+          callId,
+          fromUser: { id: actor.id, username: actor.username },
+          mode: "group",
+          groupId,
+          media,
+        });
+      }
+      socket.emit("call:invite:sent", { callId, mode: "group", memberCount: memberIds.length });
+    } catch (error) {
+      console.error("call:invite", error);
+      socket.emit("call:error", { message: "invite_failed" });
+    }
+  });
+
+  socket.on("call:accept", (raw) => {
+    const callId = String(raw?.callId || "").trim();
+    const session = activeCalls.get(callId);
+    if (!session) return socket.emit("call:error", { message: "call_not_found" });
+    if (!session.participantIds.has(Number(actor.id))) return socket.emit("call:error", { message: "not_in_call" });
+    if (!session.answeredIds) session.answeredIds = new Set([Number(session.callerId)]);
+    session.answeredIds.add(Number(actor.id));
+    session.state = "active";
+    if (session.participantIds.size && session.answeredIds.size >= session.participantIds.size) {
+      session.fullyAnsweredAtMs = Date.now();
+    }
+    const payload = {
+      callId,
+      acceptedBy: { id: actor.id, username: actor.username },
+      participantIds: [...session.participantIds],
+      answeredIds: [...session.answeredIds],
+      mode: session.mode,
+      groupId: session.groupId ?? null,
+    };
+    for (const pid of session.participantIds) {
+      emitToUser(pid, "call:accepted", payload);
+    }
+  });
+
+  socket.on("call:reject", (raw) => {
+    const callId = String(raw?.callId || "").trim();
+    const session = activeCalls.get(callId);
+    if (!session) return;
+    const uid = Number(actor.id);
+    if (!session.participantIds.has(uid)) return;
+    const answered = session.answeredIds ?? new Set([Number(session.callerId)]);
+    /** Ignore reject from a duplicate tab/socket after this user already accepted (prevents bogus miss_reject). */
+    if (answered.has(uid)) return;
+    const reason = String(raw?.reason || "rejected");
+    if (session.mode === "direct") {
+      const callerId = Number(session.callerId);
+      const calleeId = [...session.participantIds].find((id) => id !== callerId);
+      if (callerId && calleeId) {
+        const outcome = reason === "media_denied" ? "miss_media" : "miss_reject";
+        void persistDirectCallMissLog({ callerId, calleeId, callId, outcome, reason, byUserId: uid });
+      }
+    }
+    session.participantIds.delete(uid);
+    for (const pid of session.participantIds) {
+      emitToUser(pid, "call:rejected", { callId, byUserId: uid, reason });
+    }
+    activeCalls.delete(callId);
+  });
+
+  socket.on("call:end", (raw) => {
+    const callId = String(raw?.callId || "").trim();
+    const session = activeCalls.get(callId);
+    if (!session) return;
+    if (!session.participantIds.has(Number(actor.id))) return;
+    const reason = String(raw?.reason || "hangup");
+    const byUserId = Number(actor.id);
+    if (session.mode === "direct") {
+      const callerId = Number(session.callerId);
+      const calleeId = [...session.participantIds].find((id) => id !== callerId);
+      const answered = session.answeredIds ?? new Set([Number(session.callerId)]);
+      const calleeAnswered = Boolean(calleeId && answered.has(calleeId));
+      if (callerId && calleeId) {
+        if (!calleeAnswered) {
+          let outcome = "miss_hangup_ringing";
+          if (reason === "cancelled") outcome = "miss_cancel";
+          else if (reason === "hangup") outcome = "miss_hangup_ringing";
+          else if (reason === "media_denied") outcome = "miss_media";
+          else if (reason === "peer_disconnect") outcome = "miss_disconnect";
+          void persistDirectCallMissLog({ callerId, calleeId, callId, outcome, reason, byUserId });
+        } else {
+          const durationSec =
+            typeof session.fullyAnsweredAtMs === "number"
+              ? Math.max(0, Math.round((Date.now() - session.fullyAnsweredAtMs) / 1000))
+              : null;
+          const connectedAt =
+            typeof session.fullyAnsweredAtMs === "number"
+              ? new Date(session.fullyAnsweredAtMs).toISOString()
+              : null;
+          void persistDirectCallMissLog({
+            callerId,
+            calleeId,
+            callId,
+            outcome: "call_ended",
+            reason,
+            byUserId,
+            durationSec,
+            connectedAt,
+          });
+        }
+      }
+    }
+    for (const pid of session.participantIds) {
+      emitToUser(pid, "call:end", { callId, reason, byUserId });
+    }
+    activeCalls.delete(callId);
+  });
+
+  socket.on("call:signal", (raw) => {
+    const callId = String(raw?.callId || "").trim();
+    const toUserId = Number(raw?.toUserId);
+    const signal = raw?.signal;
+    if (!callId || !toUserId || !signal || !signal.type) {
+      return socket.emit("call:error", { message: "bad_signal" });
+    }
+    const session = activeCalls.get(callId);
+    if (!session) return socket.emit("call:error", { message: "call_not_found" });
+    const fromId = Number(actor.id);
+    /** Never fall back to full participantIds — that would allow ICE before the callee has accepted. */
+    const answered = session.answeredIds ?? new Set([Number(session.callerId)]);
+    if (
+      !session.participantIds.has(fromId) ||
+      !session.participantIds.has(toUserId) ||
+      !answered.has(fromId) ||
+      !answered.has(toUserId)
+    ) {
+      return socket.emit("call:error", { message: "signal_not_allowed" });
+    }
+    emitToUser(toUserId, "call:signal:recv", { callId, fromUserId: fromId, signal });
+  });
+
   socket.on("disconnect", () => {
+    userLeaveCallSessions(actor.id);
     removeUserSocket(actor.id, socket.id);
     const stillConnected = userSocketIds.get(Number(actor.id));
     if (!stillConnected || stillConnected.size === 0) {
@@ -2029,10 +2241,145 @@ const emitToUser = (userId, eventName, payload) => {
     io.to(socketId).emit(eventName, payload);
   }
 };
+
+/** End active WebRTC call sessions involving this user (socket disconnect). */
+function userLeaveCallSessions(userId) {
+  const uid = Number(userId);
+  if (!uid) return;
+  for (const [callId, session] of [...activeCalls.entries()]) {
+    if (!session?.participantIds?.has(uid)) continue;
+    const participantsBefore = [...session.participantIds];
+    const answered = session.answeredIds || new Set();
+    const callerId = Number(session.callerId);
+    const calleeId =
+      session.mode === "direct" ? participantsBefore.find((id) => id !== callerId) : null;
+    const calleeAnswered = calleeId && answered.has(calleeId);
+    session.participantIds.delete(uid);
+    const payload = { callId, reason: "peer_disconnect", leftUserId: uid };
+    for (const pid of session.participantIds) {
+      emitToUser(pid, "call:end", payload);
+    }
+    if (session.mode === "direct" && calleeId && callerId) {
+      if (!calleeAnswered) {
+        void persistDirectCallMissLog({
+          callerId,
+          calleeId,
+          callId,
+          outcome: "miss_disconnect",
+          reason: "peer_disconnect",
+          byUserId: uid,
+        });
+      } else {
+        const durationSec =
+          typeof session.fullyAnsweredAtMs === "number"
+            ? Math.max(0, Math.round((Date.now() - session.fullyAnsweredAtMs) / 1000))
+            : null;
+        const connectedAt =
+          typeof session.fullyAnsweredAtMs === "number"
+            ? new Date(session.fullyAnsweredAtMs).toISOString()
+            : null;
+        void persistDirectCallMissLog({
+          callerId,
+          calleeId,
+          callId,
+          outcome: "call_ended",
+          reason: "peer_disconnect",
+          byUserId: uid,
+          durationSec,
+          connectedAt,
+        });
+      }
+    }
+    activeCalls.delete(callId);
+  }
+}
+
 const isUserOnlineBySocket = (userId) => {
   const socketSet = userSocketIds.get(Number(userId));
   return Boolean(socketSet && socketSet.size > 0);
 };
+
+const DNO_DIRECT_CALL_LOG_MARKER = "__DNO_CALL_LOG__";
+
+/**
+ * Persist a 1:1 direct row when a call ends before both sides are connected (miss / cancel / reject / disconnect).
+ * Message is from caller → callee; content is marker + JSON for UI + debugging.
+ */
+async function persistDirectCallMissLog({
+  callerId,
+  calleeId,
+  callId,
+  outcome,
+  reason,
+  byUserId,
+  durationSec = null,
+  connectedAt = null,
+}) {
+  const a = Number(callerId);
+  const b = Number(calleeId);
+  if (!a || !b || a === b) return;
+  try {
+    const [caller, callee] = await Promise.all([
+      prisma.user.findUnique({ where: { id: a }, select: { username: true } }),
+      prisma.user.findUnique({ where: { id: b }, select: { username: true } }),
+    ]);
+    if (!caller?.username || !callee?.username) return;
+
+    let byDisplayName = null;
+    if (byUserId != null && Number(byUserId)) {
+      const who = await prisma.user.findUnique({
+        where: { id: Number(byUserId) },
+        select: { username: true, fullName: true },
+      });
+      byDisplayName = String(who?.fullName || who?.username || "").trim() || null;
+    }
+
+    const payload = {
+      v: 2,
+      outcome: String(outcome || ""),
+      callId: String(callId || ""),
+      reason: String(reason || ""),
+      byUserId: byUserId != null ? Number(byUserId) : null,
+      byDisplayName,
+      durationSec: durationSec != null && Number.isFinite(Number(durationSec)) ? Number(durationSec) : null,
+      connectedAt: connectedAt || null,
+      at: new Date().toISOString(),
+    };
+    const content = `${DNO_DIRECT_CALL_LOG_MARKER}${JSON.stringify(payload)}`.slice(0, 2000);
+    const receiverOnline = isUserOnlineBySocket(b);
+    const created = await prisma.directMessage.create({
+      data: {
+        senderId: a,
+        receiverId: b,
+        content,
+        deliveredAt: receiverOnline ? new Date() : null,
+      },
+    });
+    const basePayload = {
+      id: created.id,
+      content: created.content,
+      createdAt: created.createdAt,
+      deliveredAt: created.deliveredAt || null,
+      readAt: created.readAt || null,
+      editedAt: created.editedAt || null,
+      isDeleted: Boolean(created.isDeleted),
+      attachmentUrl: created.attachmentUrl || null,
+      attachmentName: created.attachmentName || null,
+      attachmentMime: created.attachmentMime || null,
+      attachmentSize: created.attachmentSize || null,
+      replyToMessageId: created.replyToMessageId || null,
+      replyToSender: created.replyToSender || null,
+      replyToSnippet: created.replyToSnippet || null,
+      reactions: {},
+      senderUsername: caller.username,
+      receiverUsername: callee.username,
+    };
+    emitToUser(a, "chat:message", { ...basePayload, isMine: true });
+    emitToUser(b, "chat:message", { ...basePayload, isMine: false });
+  } catch (e) {
+    console.error("persistDirectCallMissLog", e);
+  }
+}
 
 const GROUP_MENTION_USERNAME_REGEX = /(^|\s)@([a-zA-Z0-9_.-]{3,120})/g;
 const GROUP_MENTION_FULLNAME_REGEX = /@\{([^{}]{1,120})\}/g;
@@ -2256,6 +2603,7 @@ app.post(
       accessToken,
       refreshToken,
       user: {
+        id: user.id,
         username: user.username,
         role: user.role,
         fullName: user.fullName || "",
@@ -2309,6 +2657,7 @@ app.post(
       accessToken,
       refreshToken: nextRefreshToken,
       user: {
+        id: user.id,
         username: user.username,
         role: user.role,
         fullName: user.fullName || "",
@@ -2466,6 +2815,7 @@ app.get("/me", authenticateToken, async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { username: req.user.username },
       select: {
+        id: true,
         username: true,
         role: true,
         fullName: true,
@@ -2478,7 +2828,8 @@ app.get("/me", authenticateToken, async (req, res) => {
     if (!user) {
       return res.status(404).send("User not found");
     }
-    return res.json(user);
+    const numericId = Number(user.id ?? req.user?.id) || Number(req.user?.id) || 0;
+    return res.json({ ...user, id: numericId });
   } catch (error) {
     console.error(error);
     return res.status(500).send("Lỗi lấy thông tin hồ sơ cá nhân");
@@ -2510,6 +2861,7 @@ app.put(
           avatarUrl: avatarUrl !== undefined ? avatarUrl || null : undefined,
         },
         select: {
+          id: true,
           username: true,
           role: true,
           fullName: true,
@@ -5837,6 +6189,21 @@ app.patch(
   }
 );
 
+/** Minimal identity for chat/WebRTC (numeric user id). */
+app.get("/chat/session", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { username: req.user.username },
+      select: { id: true, username: true },
+    });
+    if (!user) return res.status(404).send("User not found");
+    return res.json({ id: user.id, username: user.username });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).send("Lỗi phiên chat");
+  }
+});
+
 app.get("/chat/users", authenticateToken, async (req, res) => {
   try {
     const actor = await prisma.user.findUnique({ where: { username: req.user.username } });
@@ -8603,8 +8970,34 @@ app.post(
 );
 
 // ================== START SERVER ==================
-httpServer.listen(4000, () => {
-  console.log("Backend listening on port 4000 (use http://<this-host>:4000 from clients)");
+const SERVER_PORT = Number(process.env.PORT) || 4000;
+const LISTEN_HOST = process.env.LISTEN_HOST || "0.0.0.0";
+
+function listLanIPv4Addresses() {
+  const out = [];
+  const nets = os.networkInterfaces();
+  for (const entries of Object.values(nets)) {
+    if (!entries) continue;
+    for (const net of entries) {
+      const fam = net.family;
+      const isV4 = fam === "IPv4" || fam === 4;
+      if (isV4 && !net.internal) out.push(net.address);
+    }
+  }
+  return out;
+}
+
+httpServer.listen(SERVER_PORT, LISTEN_HOST, () => {
+  console.log(`Backend listening on http://${LISTEN_HOST === "0.0.0.0" ? "0.0.0.0 (all IPv4 interfaces)" : LISTEN_HOST}:${SERVER_PORT}`);
+  console.log(`  Local:   http://localhost:${SERVER_PORT}`);
+  const lan = listLanIPv4Addresses();
+  if (lan.length) {
+    for (const ip of lan) {
+      console.log(`  Network: http://${ip}:${SERVER_PORT}`);
+    }
+  } else {
+    console.log("  Network: (no non-loopback IPv4 found — check adapters / VPN)");
+  }
 });
 
 setInterval(runOverdueNotificationJob, 60 * 1000);

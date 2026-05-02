@@ -22,6 +22,7 @@ import {
   Paper,
   Portal,
   Stack,
+  Switch,
   TextField,
   Tooltip,
   Typography,
@@ -39,6 +40,7 @@ import InsertEmoticonIcon from "@mui/icons-material/InsertEmoticon";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import SettingsIcon from "@mui/icons-material/Settings";
 import MicIcon from "@mui/icons-material/Mic";
+import MicOffIcon from "@mui/icons-material/MicOff";
 import StopCircleOutlinedIcon from "@mui/icons-material/StopCircleOutlined";
 import ImageOutlinedIcon from "@mui/icons-material/ImageOutlined";
 import SmartDisplayOutlinedIcon from "@mui/icons-material/SmartDisplayOutlined";
@@ -55,8 +57,18 @@ import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
 import SwapHorizIcon from "@mui/icons-material/SwapHoriz";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
+import VideocamIcon from "@mui/icons-material/Videocam";
+import VideocamOffIcon from "@mui/icons-material/VideocamOff";
+import CallEndIcon from "@mui/icons-material/CallEnd";
+import PhoneIcon from "@mui/icons-material/Phone";
+import PhoneDisabledIcon from "@mui/icons-material/PhoneDisabled";
+import PictureInPictureAltIcon from "@mui/icons-material/PictureInPictureAlt";
+import OpenInFullIcon from "@mui/icons-material/OpenInFull";
+import CloseFullscreenIcon from "@mui/icons-material/CloseFullscreen";
 import { io } from "socket.io-client";
 import { useI18n } from "./i18n";
+import { newWebRtcCallId, parseWebRtcIceServers, toastGetUserMediaFailure } from "./directChatWebRtc";
+import { mergeUserIdFromToken } from "./authToken";
 
 const POLL_MS = 30000;
 const DEFAULT_MAX_VOICE_RECORDING_SECONDS = 90;
@@ -71,6 +83,11 @@ const QUICK_EMOJIS = [
 ];
 const QUICK_REACTIONS = ["❤️", "👍", "😂", "😮", "😢", "👏"];
 const CHAT_STATUS_VALUES = ["AVAILABLE", "BUSY", "AWAY", "DND", "INVISIBLE"];
+/** Same user can have dashboard + #/chat popout → two sockets; this dismisses duplicate incoming UI when another window answers. */
+const DNO_CALL_COORD_BROADCAST = "dno-call-coord-v1";
+/** When set, main app chat widget should not show incoming-call UI (popout window owns it). */
+const DNO_CHAT_POPOUT_ACTIVE_KEY = "dno_chat_popout_active";
+const DNO_CHAT_POPOUT_ACTIVE_TTL_MS = 12000;
 const MESSAGE_SEARCH_TOP_N = 6;
 const normalizeStatus = (value) => {
   const next = String(value || "").trim().toUpperCase();
@@ -88,6 +105,238 @@ const CHAT_SIDEBAR_DEFAULT_PX = 260;
 const CHAT_NEAR_BOTTOM_PX = 100;
 function chatUsernameKey(username) {
   return String(username || "").trim().toLowerCase();
+}
+
+/** Only pass Autocomplete listbox props that are valid on a native `<li>` (avoids React DOM warnings). */
+function pickAutocompleteLiProps(props) {
+  const keys = [
+    "id",
+    "tabIndex",
+    "role",
+    "className",
+    "style",
+    "onClick",
+    "onMouseMove",
+    "onPointerEnter",
+    "onPointerLeave",
+    "onTouchStart",
+  ];
+  const out = {};
+  if (props.ref != null) out.ref = props.ref;
+  for (const k of keys) {
+    if (k in props && props[k] !== undefined) out[k] = props[k];
+  }
+  if ("aria-selected" in props) out["aria-selected"] = props["aria-selected"];
+  if ("aria-disabled" in props) out["aria-disabled"] = props["aria-disabled"];
+  if ("data-option-index" in props) out["data-option-index"] = props["data-option-index"];
+  return out;
+}
+
+function dnoFormatCallDurationSec(seconds, t) {
+  const sec = Math.floor(Number(seconds));
+  if (!Number.isFinite(sec) || sec < 0) return "";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return t("chatWidget.callDurationFmtHMS", { h, m, s });
+  if (m > 0) return t("chatWidget.callDurationFmtMS", { m, s });
+  return t("chatWidget.callDurationFmtS", { s });
+}
+
+function dnoAvatarInitials(label) {
+  const text = String(label || "").trim();
+  if (!text) return "?";
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] || ""}${parts[parts.length - 1][0] || ""}`.toUpperCase();
+}
+
+async function dnoFlushPendingIceOnPc(pc) {
+  const list = pc?.__dnoPendingIce;
+  if (!list?.length) return;
+  pc.__dnoPendingIce = [];
+  for (const cand of list) {
+    try {
+      await pc.addIceCandidate(cand);
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+}
+
+/** Video tracks that still produce frames (sender cam off → `muted` on receiver; ended/removed → no track). */
+function dnoRenderableRemoteVideoTracks(stream) {
+  if (!stream) return [];
+  return stream.getVideoTracks().filter((tr) => tr.readyState === "live");
+}
+
+/** Remote WebRTC: full stream on `<audio>`; `<video>` only while unmuted live video (otherwise black tile, no frozen frame). */
+function RemoteCallMedia({ stream, avatarUrl = "", displayName = "" }) {
+  const videoRef = useRef(null);
+  const audioRef = useRef(null);
+  const [showVideo, setShowVideo] = useState(false);
+  const showVideoRef = useRef(false);
+
+  useEffect(() => {
+    const vEl = videoRef.current;
+    const aEl = audioRef.current;
+    const tryPlay = (el) => {
+      if (!el?.srcObject) return;
+      const p = el.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    };
+
+    const setShow = (next) => {
+      if (showVideoRef.current === next) return;
+      showVideoRef.current = next;
+      setShowVideo(next);
+    };
+
+    const bind = () => {
+      if (!stream) {
+        if (vEl) {
+          vEl.srcObject = null;
+          try {
+            vEl.load();
+          } catch (_e) {
+            /* ignore */
+          }
+        }
+        if (aEl) aEl.srcObject = null;
+        setShow(false);
+        return;
+      }
+      const vTracks = dnoRenderableRemoteVideoTracks(stream);
+      const hasVideo = vTracks.length > 0;
+      setShow(hasVideo);
+      const vStream = hasVideo ? new MediaStream(vTracks) : null;
+      if (vEl) {
+        vEl.srcObject = vStream;
+        vEl.muted = true;
+        if (!vStream) {
+          try {
+            vEl.load();
+          } catch (_e2) {
+            /* ignore */
+          }
+        }
+      }
+      if (aEl) {
+        aEl.srcObject = stream;
+        aEl.muted = false;
+        try {
+          aEl.volume = 1;
+        } catch (_e3) {
+          /* ignore */
+        }
+      }
+      tryPlay(vEl);
+      tryPlay(aEl);
+    };
+
+    const trackUnsubs = [];
+
+    const attachVideoTrackListeners = () => {
+      for (const tr of stream.getVideoTracks()) {
+        const onChange = () => bind();
+        tr.addEventListener("mute", onChange);
+        tr.addEventListener("unmute", onChange);
+        tr.addEventListener("ended", onChange);
+        trackUnsubs.push(() => {
+          tr.removeEventListener("mute", onChange);
+          tr.removeEventListener("unmute", onChange);
+          tr.removeEventListener("ended", onChange);
+        });
+      }
+    };
+
+    bind();
+    if (stream) attachVideoTrackListeners();
+
+    const onStreamChange = () => {
+      while (trackUnsubs.length) {
+        try {
+          trackUnsubs.pop()();
+        } catch (_e4) {
+          /* ignore */
+        }
+      }
+      bind();
+      if (stream) attachVideoTrackListeners();
+    };
+
+    if (stream) {
+      stream.addEventListener("addtrack", onStreamChange);
+      stream.addEventListener("removetrack", onStreamChange);
+    }
+    const onMediaReady = () => {
+      tryPlay(videoRef.current);
+      tryPlay(audioRef.current);
+    };
+    vEl?.addEventListener("loadedmetadata", onMediaReady);
+    aEl?.addEventListener("loadedmetadata", onMediaReady);
+    vEl?.addEventListener("canplay", onMediaReady);
+    aEl?.addEventListener("canplay", onMediaReady);
+
+    return () => {
+      if (stream) {
+        stream.removeEventListener("addtrack", onStreamChange);
+        stream.removeEventListener("removetrack", onStreamChange);
+      }
+      while (trackUnsubs.length) {
+        try {
+          trackUnsubs.pop()();
+        } catch (_e5) {
+          /* ignore */
+        }
+      }
+      vEl?.removeEventListener("loadedmetadata", onMediaReady);
+      aEl?.removeEventListener("loadedmetadata", onMediaReady);
+      vEl?.removeEventListener("canplay", onMediaReady);
+      aEl?.removeEventListener("canplay", onMediaReady);
+      if (vEl) {
+        vEl.srcObject = null;
+        try {
+          vEl.load();
+        } catch (_e6) {
+          /* ignore */
+        }
+      }
+      if (aEl) aEl.srcObject = null;
+    };
+  }, [stream]);
+
+  return (
+    <Box sx={{ position: "relative", width: "100%", height: "100%", bgcolor: "#000", minHeight: "100%" }}>
+      <audio
+        ref={audioRef}
+        playsInline
+        autoPlay
+        style={{ position: "absolute", width: 0, height: 0, opacity: 0, pointerEvents: "none" }}
+      />
+      <video
+        ref={videoRef}
+        playsInline
+        autoPlay
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          opacity: showVideo ? 1 : 0,
+          transition: "opacity 0.12s ease-out",
+        }}
+      />
+      {!showVideo && (
+        <Box sx={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Avatar src={avatarUrl || undefined} sx={{ width: 56, height: 56, bgcolor: "rgba(255,255,255,0.12)", color: "#fff" }}>
+            {dnoAvatarInitials(displayName)}
+          </Avatar>
+        </Box>
+      )}
+    </Box>
+  );
 }
 
 function chatMessageListMaxScrollTop(root) {
@@ -187,7 +436,13 @@ function ChatTruncationTooltip({ title, children }) {
   );
 }
 
-export default function DirectChatWidget({ currentUser, toastApi, isPopout = false }) {
+export default function DirectChatWidget({
+  currentUser,
+  toastApi,
+  isPopout = false,
+  /** When false, incoming/outgoing call dialogs start with camera off (same-machine two-user testing). */
+  defaultCallVideoEnabled = true,
+}) {
   const { t, language } = useI18n();
   const [open, setOpen] = useState(Boolean(isPopout));
   const [users, setUsers] = useState([]);
@@ -235,6 +490,9 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   const [conversationMenuAnchorEl, setConversationMenuAnchorEl] = useState(null);
   const [conversationMenuTarget, setConversationMenuTarget] = useState(null);
   const [statusMenuAnchorEl, setStatusMenuAnchorEl] = useState(null);
+  const [callStartAnchorEl, setCallStartAnchorEl] = useState(null);
+  /** In-call overlay docked bottom-right so the message list stays usable in the same window. */
+  const [callPanelCompact, setCallPanelCompact] = useState(false);
   const [myChatStatus, setMyChatStatus] = useState(() => normalizeStatus(localStorage.getItem("chatMyStatus")));
   const [deleteConfirmDialog, setDeleteConfirmDialog] = useState({
     open: false,
@@ -274,11 +532,42 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   const lastRateLimitToastAtRef = useRef(0);
   const latestMessageIdByUserRef = useRef({});
   const messageListRef = useRef(null);
+  const callPanelRef = useRef(null);
   const nearBottomRef = useRef(true);
   const prevDirectTailMessageIdRef = useRef(0);
   const prevGroupTailMessageIdRef = useRef(0);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const socketRef = useRef(null);
+  const currentUserRef = useRef(currentUser);
+  /** Numeric DB user id for WebRTC (from JWT merge and/or GET /chat/session). */
+  const chatNumericUserIdRef = useRef(0);
+  const [callPhase, setCallPhase] = useState("idle");
+  const [activeCallId, setActiveCallId] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const incomingCallRef = useRef(null);
+  const [activeCallMode, setActiveCallMode] = useState(null);
+  const [callMedia, setCallMedia] = useState(() => ({
+    audio: true,
+    video: defaultCallVideoEnabled !== false,
+  }));
+  const [answeredPeerIds, setAnsweredPeerIds] = useState([]);
+  const [remoteStreamsByUserId, setRemoteStreamsByUserId] = useState({});
+  const [localPreviewTick, setLocalPreviewTick] = useState(0);
+  const [micOn, setMicOn] = useState(true);
+  const [camOn, setCamOn] = useState(true);
+  const peerConnectionsRef = useRef(new Map());
+  /** ICE JSON payloads received before the peer PC exists (same numeric keys as peerConnectionsRef). */
+  const pendingIceBeforePcRef = useRef(new Map());
+  const localStreamRef = useRef(null);
+  const callPhaseRef = useRef("idle");
+  const activeCallIdRef = useRef(null);
+  const callMediaPrefsRef = useRef({
+    audio: true,
+    video: defaultCallVideoEnabled !== false,
+  });
+  const hangupEmittedForCallIdRef = useRef(null);
+  const webRtcCleanupRef = useRef(() => {});
+  const localVideoRef = useRef(null);
   const selectedUsernameRef = useRef("");
   const fileInputRef = useRef(null);
   const imageInputRef = useRef(null);
@@ -286,6 +575,17 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   const composerInputRef = useRef(null);
   const searchInputRef = useRef(null);
   const audioContextRef = useRef(null);
+  /** Incoming-call ringtone interval + stable {start,stop} for socket cleanup. */
+  const incomingCallRingIntervalRef = useRef(null);
+  const incomingCallRingControlRef = useRef({ start: () => {}, stop: () => {} });
+  /** Latest resolver for WebRTC user id (socket handlers run before this hook in source order). */
+  const resolveMyNumericUserIdForCallsRef = useRef(null);
+  /** True while acceptIncomingCall is running — blocks Dialog onClose → reject (spurious reject during gUM). */
+  const acceptFlowActiveRef = useRef(false);
+  const callCoordBcRef = useRef(null);
+  const callCoordInstanceIdRef = useRef(
+    `dno-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`}`
+  );
   const mediaRecorderRef = useRef(null);
   const voiceChunksRef = useRef([]);
   const voiceRecordTimerRef = useRef(null);
@@ -308,6 +608,146 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   useEffect(() => {
     chatSidebarWidthPxRef.current = chatSidebarWidthPx;
   }, [chatSidebarWidthPx]);
+
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  useEffect(() => {
+    const id = Number(currentUser?.id) || 0;
+    if (id > 0) chatNumericUserIdRef.current = id;
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!currentUser?.username) return undefined;
+    const token = localStorage.getItem("token");
+    if (!token) return undefined;
+    let cancelled = false;
+    (async () => {
+      let id = Number(mergeUserIdFromToken(currentUser ?? {}, token)?.id) || 0;
+      if (!id) {
+        try {
+          const raw = localStorage.getItem("user");
+          if (raw) id = Number(JSON.parse(raw).id) || 0;
+        } catch (_e) {}
+      }
+      if (id > 0 && !cancelled) {
+        chatNumericUserIdRef.current = id;
+        return;
+      }
+      try {
+        const { data } = await axios.get(`${API_BASE}/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        id = Number(data?.id) || Number(mergeUserIdFromToken(data, token)?.id) || 0;
+        if (cancelled || id <= 0) {
+          try {
+            const { data: s } = await axios.get(`${API_BASE}/chat/session`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            id = Number(s?.id) || 0;
+          } catch (_e2) {
+            /* /chat/session optional on older servers */
+          }
+        }
+        if (cancelled || id <= 0) return;
+        chatNumericUserIdRef.current = id;
+        try {
+          const raw = localStorage.getItem("user");
+          const prev = raw ? JSON.parse(raw) : {};
+          localStorage.setItem("user", JSON.stringify({ ...prev, id }));
+        } catch (_e) {}
+      } catch (_e) {
+        try {
+          const { data } = await axios.get(`${API_BASE}/chat/session`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          id = Number(data?.id) || 0;
+          if (cancelled || id <= 0) return;
+          chatNumericUserIdRef.current = id;
+          try {
+            const raw = localStorage.getItem("user");
+            const prev = raw ? JSON.parse(raw) : {};
+            localStorage.setItem("user", JSON.stringify({ ...prev, id }));
+          } catch (_e2) {}
+        } catch (_e2) {
+          /* ignore */
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.username, currentUser?.id]);
+
+  useLayoutEffect(() => {
+    callPhaseRef.current = callPhase;
+  }, [callPhase]);
+  useEffect(() => {
+    if (callPhase === "idle") setCallPanelCompact(false);
+  }, [callPhase]);
+  useLayoutEffect(() => {
+    incomingCallRef.current = incomingCall;
+  }, [incomingCall]);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return undefined;
+    let bc;
+    try {
+      bc = new BroadcastChannel(DNO_CALL_COORD_BROADCAST);
+    } catch (_e) {
+      return undefined;
+    }
+    const onMessage = (ev) => {
+      const msg = ev?.data;
+      if (!msg || typeof msg !== "object" || msg.type !== "dno_call_accept_started" || !msg.callId) return;
+      if (msg.from && msg.from === callCoordInstanceIdRef.current) return;
+      const cid = String(msg.callId);
+      try {
+        incomingCallRingControlRef.current?.stop?.();
+      } catch (_e2) {
+        /* ignore */
+      }
+      setIncomingCall((cur) => {
+        if (cur && String(cur.callId) === cid) {
+          incomingCallRef.current = null;
+          return null;
+        }
+        return cur;
+      });
+      setCallPhase((ph) => {
+        if (ph === "incoming") {
+          callPhaseRef.current = "idle";
+          return "idle";
+        }
+        return ph;
+      });
+      setActiveCallId((aid) => (aid != null && String(aid) === cid ? null : aid));
+    };
+    bc.addEventListener("message", onMessage);
+    callCoordBcRef.current = bc;
+    return () => {
+      callCoordBcRef.current = null;
+      try {
+        bc.removeEventListener("message", onMessage);
+        bc.close();
+      } catch (_e) {
+        /* ignore */
+      }
+    };
+  }, []);
+  useEffect(() => {
+    activeCallIdRef.current = activeCallId;
+  }, [activeCallId]);
+  useEffect(() => {
+    callMediaPrefsRef.current = callMedia;
+  }, [callMedia]);
+  useLayoutEffect(() => {
+    const el = localVideoRef.current;
+    if (el && localStreamRef.current) {
+      el.srcObject = localStreamRef.current;
+    }
+  }, [localPreviewTick, callPhase]);
 
   useEffect(() => {
     const onMove = (e) => {
@@ -370,6 +810,49 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     () => groups.find((item) => Number(item.id) === Number(selectedGroupId)) || null,
     [groups, selectedGroupId]
   );
+  /** Numeric user id → label/avatar for call tiles (direct directory + group members). */
+  const callPeerMetaById = useMemo(() => {
+    const m = new Map();
+    const put = (id, fullName, username, avatarUrl) => {
+      const n = Number(id);
+      if (!n) return;
+      const label = String(fullName || username || "").trim();
+      if (label || avatarUrl) m.set(n, { label, avatarUrl: avatarUrl || "" });
+    };
+    for (const item of users) put(item?.id, item?.fullName, item?.username, item?.avatarUrl);
+    for (const item of directoryUsers) put(item?.id, item?.fullName, item?.username, item?.avatarUrl);
+    for (const mem of selectedGroup?.members || []) put(mem?.id, mem?.fullName, mem?.username, mem?.avatarUrl);
+    put(currentUser?.id, currentUser?.fullName, currentUser?.username, currentUser?.avatarUrl);
+    return m;
+  }, [users, directoryUsers, selectedGroup, currentUser]);
+  const incomingCallerMeta = useMemo(() => {
+    const username = String(incomingCall?.fromUser?.username || "").trim();
+    if (!username) return null;
+    const merged = [...users, ...directoryUsers, ...(selectedGroup?.members || [])];
+    const found = merged.find((u) => chatUsernameKey(u?.username) === chatUsernameKey(username));
+    return {
+      username,
+      label: String(found?.fullName || found?.username || username).trim(),
+      avatarUrl: String(found?.avatarUrl || "").trim(),
+      hasPresence: Boolean(found),
+      online: found != null ? Boolean(found.online) : null,
+      status: String(found?.status || "AVAILABLE"),
+    };
+  }, [incomingCall, users, directoryUsers, selectedGroup]);
+  /** Keep remote call tiles visible even when a peer has no current media tracks (e.g. both sides camera-off). */
+  const callRemotePeerIds = useMemo(() => {
+    const me = Number(currentUser?.id) || 0;
+    const ids = new Set();
+    for (const uid of answeredPeerIds || []) {
+      const n = Number(uid);
+      if (n && n !== me) ids.add(n);
+    }
+    for (const uid of Object.keys(remoteStreamsByUserId || {})) {
+      const n = Number(uid);
+      if (n && n !== me) ids.add(n);
+    }
+    return [...ids];
+  }, [answeredPeerIds, remoteStreamsByUserId, currentUser?.id]);
   const canManageSelectedGroup = useMemo(() => {
     if (!selectedGroup || !currentUser?.username) return false;
     const owner = (selectedGroup.members || []).find((member) => Number(member.id) === Number(selectedGroup.ownerId));
@@ -872,6 +1355,70 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     }
   };
 
+  const stopIncomingCallRing = () => {
+    if (incomingCallRingIntervalRef.current != null) {
+      clearInterval(incomingCallRingIntervalRef.current);
+      incomingCallRingIntervalRef.current = null;
+    }
+  };
+
+  /** Classic dual-tone ring (440+480 Hz), two short bursts then pause — repeats until stopped. */
+  const playIncomingCallRingBurstPair = (ctx) => {
+    const playBeep = (offsetSec) => {
+      const dur = 0.38;
+      const t0 = ctx.currentTime + offsetSec;
+      const g = ctx.createGain();
+      g.connect(ctx.destination);
+      const o1 = ctx.createOscillator();
+      const o2 = ctx.createOscillator();
+      o1.type = "sine";
+      o2.type = "sine";
+      o1.frequency.value = 440;
+      o2.frequency.value = 480;
+      o1.connect(g);
+      o2.connect(g);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(0.1, t0 + 0.02);
+      g.gain.setValueAtTime(0.1, t0 + dur - 0.05);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o1.start(t0);
+      o2.start(t0);
+      o1.stop(t0 + dur);
+      o2.stop(t0 + dur);
+    };
+    playBeep(0.02);
+    playBeep(0.48);
+  };
+
+  const startIncomingCallRing = () => {
+    void (async () => {
+      stopIncomingCallRing();
+      const ctx = unlockAudioIfNeeded();
+      if (!ctx) return;
+      try {
+        if (ctx.state !== "running") await ctx.resume();
+      } catch (_e) {
+        /* ignore */
+      }
+      playIncomingCallRingBurstPair(ctx);
+      incomingCallRingIntervalRef.current = window.setInterval(() => {
+        void (async () => {
+          try {
+            if (ctx.state !== "running") await ctx.resume();
+            playIncomingCallRingBurstPair(ctx);
+          } catch (_e) {
+            /* ignore */
+          }
+        })();
+      }, 3200);
+    })();
+  };
+
+  incomingCallRingControlRef.current = {
+    start: startIncomingCallRing,
+    stop: stopIncomingCallRing,
+  };
+
   const loadUsers = async () => {
     try {
       const res = await axios.get(API_BASE + "/chat/conversations");
@@ -974,6 +1521,11 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     }
   };
 
+  const loadConversationRef = useRef(loadConversation);
+  useEffect(() => {
+    loadConversationRef.current = loadConversation;
+  }, [loadConversation]);
+
   const loadMoreMessages = async () => {
     if (!selectedUsername || loadingMore || !hasMore || messages.length === 0) return;
     setLoadingMore(true);
@@ -995,6 +1547,37 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   useEffect(() => {
     selectedUsernameRef.current = selectedUsername;
   }, [selectedUsername]);
+
+  useEffect(() => {
+    if (!isPopout || typeof window === "undefined") return;
+    try {
+      const h = String(window.location.hash || "").replace(/^#/, "");
+      const [pathPart, queryPart] = h.split("?");
+      const path = (pathPart || "").replace(/^\//, "");
+      if (!path.toLowerCase().startsWith("chat")) return;
+      const params = new URLSearchParams(queryPart || "");
+      const u = params.get("u") || params.get("direct");
+      if (u) {
+        setChatMode("direct");
+        setSelectedUsername(decodeURIComponent(u));
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }, [isPopout]);
+
+  const selectedGroupIdRef = useRef(selectedGroupId);
+  const mutedDirectUsernamesRef = useRef(mutedDirectUsernames);
+  const mutedGroupIdsRef = useRef(mutedGroupIds);
+  const tSocketRef = useRef(t);
+  const toastApiSocketRef = useRef(toastApi);
+  useEffect(() => {
+    selectedGroupIdRef.current = selectedGroupId;
+    mutedDirectUsernamesRef.current = mutedDirectUsernames;
+    mutedGroupIdsRef.current = mutedGroupIds;
+    tSocketRef.current = t;
+    toastApiSocketRef.current = toastApi;
+  }, [selectedGroupId, mutedDirectUsernames, mutedGroupIds, t, toastApi]);
 
   useEffect(() => {
     if (!currentUser?.username) return;
@@ -1069,9 +1652,14 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     if (!token) return;
     const socket = io(API_BASE, {
       auth: { token },
-      transports: ["websocket", "polling"],
+      transports: ["polling", "websocket"],
     });
     socketRef.current = socket;
+    const syncSocketAuthFromStorage = () => {
+      const t = localStorage.getItem("token");
+      if (t) socket.auth = { token: t };
+    };
+    socket.io.on("reconnect_attempt", syncSocketAuthFromStorage);
     socket.on("connect", () => {
       setSocketConnected(true);
       socket.emit("chat:presence:ping");
@@ -1100,17 +1688,21 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
       const targetUsername = payload.isMine ? payload.receiverUsername : payload.senderUsername;
       const targetKey = chatUsernameKey(targetUsername);
       const selectedKey = chatUsernameKey(selectedUsernameRef.current || "");
-      const isMutedDirect = mutedDirectUsernames.some((u) => chatUsernameKey(u) === targetKey);
-      if (!payload.isMine && !isMutedDirect) {
+      const isMutedDirect = mutedDirectUsernamesRef.current.some((u) => chatUsernameKey(u) === targetKey);
+      const isCallLogLine = String(payload.content || "").startsWith("__DNO_CALL_LOG__");
+      if (!payload.isMine && !isMutedDirect && !isCallLogLine) {
         playIncomingSound();
       }
       const bumpRow = (item) => {
         if (chatUsernameKey(item.username) !== targetKey) return item;
+        const lastText = String(payload.content || "").startsWith("__DNO_CALL_LOG__")
+          ? `[${tSocketRef.current("chatWidget.callMissLogBadge")}]`
+          : payload.attachmentName
+            ? `[${tSocketRef.current("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
+            : payload.content || "";
         return {
           ...item,
-          lastMessageText: payload.attachmentName
-            ? `[${t("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
-            : payload.content || "",
+          lastMessageText: lastText,
           lastMessageAt: payload.createdAt || null,
           unreadCount:
             payload.isMine || chatUsernameKey(item.username) === selectedKey
@@ -1131,11 +1723,14 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
         return prev.map((item) => bumpRow(item));
       });
       setDirectoryUsers((prev) => prev.map((item) => bumpRow(item)));
-      const relatedToSelected =
-        selectedKey &&
-        (chatUsernameKey(payload.senderUsername || "") === selectedKey ||
-          chatUsernameKey(payload.receiverUsername || "") === selectedKey);
-      if (relatedToSelected) {
+      const senderKey = chatUsernameKey(payload.senderUsername || "");
+      const recvKey = chatUsernameKey(payload.receiverUsername || "");
+      const directPeerMatch =
+        Boolean(selectedKey) &&
+        Boolean(senderKey) &&
+        Boolean(recvKey) &&
+        (senderKey === selectedKey || recvKey === selectedKey);
+      if (directPeerMatch) {
         setMessages((prev) => {
           if (prev.some((item) => Number(item.id) === Number(payload.id))) return prev;
           return [...prev, payload];
@@ -1153,15 +1748,15 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
             ? {
                 ...item,
                 lastMessageText: payload.attachmentName
-                  ? `[${t("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
+                  ? `[${tSocketRef.current("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
                   : payload.content || "",
                 lastMessageAt: payload.createdAt || item.lastMessageAt,
                 unreadCount:
-                  payload.isMine || Number(selectedGroupId || 0) === Number(payload.groupId)
+                  payload.isMine || Number(selectedGroupIdRef.current || 0) === Number(payload.groupId)
                     ? Number(item.unreadCount || 0)
                     : Number(item.unreadCount || 0) + 1,
                 mentionUnreadCount:
-                  payload.isMine || Number(selectedGroupId || 0) === Number(payload.groupId)
+                  payload.isMine || Number(selectedGroupIdRef.current || 0) === Number(payload.groupId)
                     ? Number(item.mentionUnreadCount || 0)
                     : payload.mentionMe
                       ? Number(item.mentionUnreadCount || 0) + 1
@@ -1170,17 +1765,17 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
             : item
         )
       );
-      if (Number(selectedGroupId || 0) === Number(payload.groupId)) {
+      if (Number(selectedGroupIdRef.current || 0) === Number(payload.groupId)) {
         setGroupMessages((prev) => {
           if (prev.some((item) => Number(item.id) === Number(payload.id))) return prev;
           return [...prev, payload];
         });
       } else if (!payload.isMine) {
-        const isMutedGroup = mutedGroupIds.includes(Number(payload.groupId));
+        const isMutedGroup = mutedGroupIdsRef.current.includes(Number(payload.groupId));
         if (isMutedGroup) return;
         if (payload.mentionMe) {
           playMentionSound();
-          toastApi?.info(`@${currentUser?.username} được nhắc tới trong nhóm`);
+          toastApiSocketRef.current?.info(`@${currentUserRef.current?.username} được nhắc tới trong nhóm`);
         } else {
           playIncomingSound();
         }
@@ -1204,9 +1799,9 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
             ? {
                 ...item,
                 lastMessageText: payload.isDeleted
-                  ? t("chatWidget.messageDeleted")
+                  ? tSocketRef.current("chatWidget.messageDeleted")
                   : payload.attachmentName
-                    ? `[${t("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
+                    ? `[${tSocketRef.current("chatWidget.attachmentLabel")}] ${payload.attachmentName}`
                     : payload.content || item.lastMessageText,
                 unreadCount: 0,
               }
@@ -1249,15 +1844,428 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
         )
       );
     });
+
+    const iceServers = parseWebRtcIceServers();
+    const getMyUserId = () => {
+      if (chatNumericUserIdRef.current) return chatNumericUserIdRef.current;
+      const token = localStorage.getItem("token");
+      let id = Number(mergeUserIdFromToken(currentUserRef.current ?? {}, token)?.id) || 0;
+      if (id) {
+        chatNumericUserIdRef.current = id;
+        return id;
+      }
+      try {
+        const raw = localStorage.getItem("user");
+        if (raw) id = Number(JSON.parse(raw).id) || 0;
+      } catch (_e) {}
+      if (id) chatNumericUserIdRef.current = id;
+      return id;
+    };
+
+    function closeAllPeerConnections() {
+      pendingIceBeforePcRef.current.clear();
+      peerConnectionsRef.current.forEach((pc) => {
+        try {
+          pc.close();
+        } catch (_e) {}
+      });
+      peerConnectionsRef.current.clear();
+    }
+
+    async function applyIceToPeerConnection(pc, candidateJson) {
+      try {
+        const cand = new RTCIceCandidate(candidateJson);
+        if (!pc.remoteDescription) {
+          if (!pc.__dnoPendingIce) pc.__dnoPendingIce = [];
+          pc.__dnoPendingIce.push(cand);
+          return;
+        }
+        await pc.addIceCandidate(cand);
+      } catch (_e) {}
+    }
+
+    async function flushPendingRemoteIceOnPc(pc) {
+      await dnoFlushPendingIceOnPc(pc);
+    }
+
+    async function flushEarlyIceCandidatesForPeer(remoteUserId, pc) {
+      const raw = pendingIceBeforePcRef.current.get(remoteUserId);
+      if (!raw?.length) return;
+      pendingIceBeforePcRef.current.delete(remoteUserId);
+      for (const candidateJson of raw) {
+        await applyIceToPeerConnection(pc, candidateJson);
+      }
+    }
+
+    async function queueOrApplyRemoteIce(fromUserId, candidateJson) {
+      const pc = peerConnectionsRef.current.get(fromUserId);
+      if (!pc) {
+        const list = pendingIceBeforePcRef.current.get(fromUserId) || [];
+        list.push(candidateJson);
+        pendingIceBeforePcRef.current.set(fromUserId, list);
+        return;
+      }
+      await applyIceToPeerConnection(pc, candidateJson);
+    }
+
+    function cleanupCallSession(opts = {}) {
+      try {
+        incomingCallRingControlRef.current?.stop?.();
+      } catch (_e) {
+        /* ignore */
+      }
+      closeAllPeerConnections();
+      if (localStreamRef.current) {
+        try {
+          localStreamRef.current.getTracks().forEach((tr) => tr.stop());
+        } catch (_e) {}
+        localStreamRef.current = null;
+      }
+      setRemoteStreamsByUserId({});
+      setCallPhase("idle");
+      callPhaseRef.current = "idle";
+      setActiveCallId(null);
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+      setActiveCallMode(null);
+      setAnsweredPeerIds([]);
+      setMicOn(true);
+      setCamOn(true);
+      hangupEmittedForCallIdRef.current = null;
+      activeCallIdRef.current = null;
+      if (opts.toastKey) toastApiSocketRef.current?.info(tSocketRef.current(opts.toastKey));
+    }
+
+    webRtcCleanupRef.current = () => cleanupCallSession({});
+
+    function emitCallSignal(toUserId, signal) {
+      const cid = activeCallIdRef.current;
+      if (!cid || !toUserId) return;
+      socket.emit("call:signal", { callId: cid, toUserId, signal });
+    }
+
+    async function ensureLocalStream() {
+      if (localStreamRef.current) return localStreamRef.current;
+      const { audio, video } = callMediaPrefsRef.current;
+      let ms;
+      if (!audio && !video) {
+        ms = new MediaStream();
+      } else {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("no_get_user_media");
+        }
+        ms = await navigator.mediaDevices.getUserMedia({ audio, video });
+      }
+      localStreamRef.current = ms;
+      setMicOn(ms.getAudioTracks().some((tr) => tr.enabled));
+      setCamOn(ms.getVideoTracks().some((tr) => tr.enabled));
+      setLocalPreviewTick((n) => n + 1);
+      return ms;
+    }
+
+    async function attachLocalTracks(pc) {
+      const ms = await ensureLocalStream();
+      for (const tr of ms.getTracks()) {
+        const sender = pc.addTrack(tr, ms);
+        if (sender) sender.__dnoKind = tr.kind;
+      }
+    }
+
+    function createPeerConnection(remoteUserId) {
+      const existing = peerConnectionsRef.current.get(remoteUserId);
+      if (existing) {
+        try {
+          existing.close();
+        } catch (_e) {}
+      }
+      const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 4 });
+      peerConnectionsRef.current.set(remoteUserId, pc);
+      void flushEarlyIceCandidatesForPeer(remoteUserId, pc);
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          const cand = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+          emitCallSignal(remoteUserId, { type: "ice-candidate", candidate: cand });
+        }
+      };
+      pc.ontrack = (ev) => {
+        const incoming = ev.streams && ev.streams[0];
+        const track = ev.track;
+        if (!track) return;
+        setRemoteStreamsByUserId((prev) => {
+          const prevStream = prev[remoteUserId];
+          if (!prevStream) {
+            const next = incoming || new MediaStream([track]);
+            return { ...prev, [remoteUserId]: next };
+          }
+          const merged = new MediaStream();
+          const safeAdd = (ms, tr) => {
+            if (!tr || tr.readyState === "ended") return;
+            if (ms.getTracks().some((x) => x.id === tr.id)) return;
+            ms.addTrack(tr);
+          };
+          const prevAudios = prevStream.getAudioTracks().filter((t) => t.readyState !== "ended");
+          const prevVideos = prevStream.getVideoTracks().filter((t) => t.readyState !== "ended");
+          if (track.kind === "audio") {
+            for (const t of prevAudios) safeAdd(merged, t);
+            for (const t of prevVideos) {
+              if (t.readyState === "live") safeAdd(merged, t);
+            }
+            safeAdd(merged, track);
+          } else if (track.kind === "video") {
+            for (const t of prevAudios) safeAdd(merged, t);
+            safeAdd(merged, track);
+          } else {
+            for (const t of prevStream.getTracks()) {
+              if (t.readyState !== "ended") safeAdd(merged, t);
+            }
+            safeAdd(merged, track);
+          }
+          return { ...prev, [remoteUserId]: merged };
+        });
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed") {
+          console.warn("WebRTC connection failed", { remoteUserId });
+          toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callNegotiationError"));
+        }
+      };
+      return pc;
+    }
+
+    async function createAndSendOffer(remoteUserId) {
+      const pc = createPeerConnection(remoteUserId);
+      await attachLocalTracks(pc);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await flushPendingRemoteIceOnPc(pc);
+      emitCallSignal(remoteUserId, { type: "offer", sdp: offer.sdp });
+    }
+
+    async function handleIncomingSignal(fromUserId, signal) {
+      if (!signal?.type) return;
+      let myUserId = getMyUserId();
+      if (!myUserId && typeof resolveMyNumericUserIdForCallsRef.current === "function") {
+        try {
+          myUserId = await resolveMyNumericUserIdForCallsRef.current();
+        } catch (_e) {
+          myUserId = 0;
+        }
+      }
+      if (!myUserId) {
+        toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callMissingUserId"));
+        return;
+      }
+
+      try {
+        if (signal.type === "ice-candidate" && signal.candidate) {
+          await queueOrApplyRemoteIce(fromUserId, signal.candidate);
+          return;
+        }
+
+        if (signal.type === "offer" && signal.sdp) {
+          let pc = peerConnectionsRef.current.get(fromUserId);
+          if (pc) {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp }));
+            await flushPendingRemoteIceOnPc(pc);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await flushPendingRemoteIceOnPc(pc);
+            emitCallSignal(fromUserId, { type: "answer", sdp: answer.sdp });
+            return;
+          }
+          pc = createPeerConnection(fromUserId);
+          await attachLocalTracks(pc);
+          await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp }));
+          await flushPendingRemoteIceOnPc(pc);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await flushPendingRemoteIceOnPc(pc);
+          emitCallSignal(fromUserId, { type: "answer", sdp: answer.sdp });
+          return;
+        }
+
+        if (signal.type === "answer" && signal.sdp) {
+          const pc = peerConnectionsRef.current.get(fromUserId);
+          if (!pc) return;
+          await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp }));
+          await flushPendingRemoteIceOnPc(pc);
+        }
+      } catch (err) {
+        console.error("call:signal handling failed", err);
+        toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callNegotiationError"));
+      }
+    }
+
+    async function onCallAcceptedPayload(payload) {
+      let myUserId = getMyUserId();
+      if (!myUserId && typeof resolveMyNumericUserIdForCallsRef.current === "function") {
+        try {
+          myUserId = await resolveMyNumericUserIdForCallsRef.current();
+        } catch (_e) {
+          myUserId = 0;
+        }
+      }
+      if (!myUserId) return;
+      const callId = String(payload?.callId || "").trim();
+      const answered = (payload.answeredIds || []).map(Number).filter(Boolean);
+      if (!callId || !answered.includes(myUserId)) {
+        if (callId) {
+          toastApiSocketRef.current?.error(
+            tSocketRef.current("chatWidget.callErrorGeneric", { msg: "join_mismatch" })
+          );
+        }
+        return;
+      }
+
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+      setOpen(true);
+      activeCallIdRef.current = callId;
+      setActiveCallId(callId);
+      setAnsweredPeerIds(answered);
+
+      try {
+        await ensureLocalStream();
+      } catch (e) {
+        toastGetUserMediaFailure(toastApiSocketRef.current, tSocketRef.current, e);
+        hangupEmittedForCallIdRef.current = callId;
+        socket.emit("call:end", { callId, reason: "media_denied" });
+        cleanupCallSession({});
+        return;
+      }
+
+      setCallPhase("inCall");
+      const remotes = answered.filter((id) => id !== myUserId);
+      for (const rid of remotes) {
+        if (myUserId < rid) {
+          const existing = peerConnectionsRef.current.get(rid);
+          if (existing) continue;
+          try {
+            await createAndSendOffer(rid);
+          } catch (err) {
+            console.error(err);
+            toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callNegotiationError"));
+          }
+        }
+      }
+    }
+
+    socket.on("call:invite:recv", (payload) => {
+      if (!payload?.callId) return;
+      const cid = String(payload.callId);
+      if (!isPopout) {
+        try {
+          const raw = localStorage.getItem(DNO_CHAT_POPOUT_ACTIVE_KEY);
+          const ts = Number(raw || 0);
+          if (Number.isFinite(ts) && ts > 0) {
+            if (Date.now() - ts < DNO_CHAT_POPOUT_ACTIVE_TTL_MS) {
+              return;
+            }
+            localStorage.removeItem(DNO_CHAT_POPOUT_ACTIVE_KEY);
+          }
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      /** Another popout may be in outgoing dial; this socket would drop the invite while other windows ring — cancel outbound first. */
+      if (callPhaseRef.current === "outgoing") {
+        const outCid = activeCallIdRef.current;
+        if (outCid && hangupEmittedForCallIdRef.current !== outCid) {
+          hangupEmittedForCallIdRef.current = outCid;
+          socket.emit("call:end", { callId: outCid, reason: "cancelled" });
+        }
+        webRtcCleanupRef.current();
+        callPhaseRef.current = "idle";
+      }
+      if (callPhaseRef.current === "incoming") {
+        const cur = incomingCallRef.current;
+        if (cur && String(cur.callId) === cid) return;
+        toastApiSocketRef.current?.warning(tSocketRef.current("chatWidget.callBusy"));
+        return;
+      }
+      if (callPhaseRef.current !== "idle") {
+        toastApiSocketRef.current?.warning(tSocketRef.current("chatWidget.callBusy"));
+        return;
+      }
+      activeCallIdRef.current = cid;
+      setActiveCallId(cid);
+      setIncomingCall(payload);
+      incomingCallRef.current = payload;
+      setCallPhase("incoming");
+      callPhaseRef.current = "incoming";
+      try {
+        incomingCallRingControlRef.current?.start?.();
+      } catch (_e) {
+        /* ignore */
+      }
+    });
+
+    socket.on("call:accepted", (payload) => {
+      void onCallAcceptedPayload(payload);
+    });
+
+    socket.on("call:rejected", (payload) => {
+      const callId = String(payload?.callId || "");
+      if (callId && callId !== String(activeCallIdRef.current)) return;
+      cleanupCallSession({ toastKey: "chatWidget.callRejected" });
+      const u = selectedUsernameRef.current;
+      if (u) void loadConversationRef.current?.(u, true);
+    });
+
+    socket.on("call:end", (payload) => {
+      const callId = String(payload?.callId || "");
+      if (!callId || callId !== String(activeCallIdRef.current)) return;
+      const reason = String(payload?.reason || "");
+      if (reason && reason !== "hangup" && reason !== "cancelled") {
+        cleanupCallSession({ toastKey: "chatWidget.callEndedRemote" });
+      } else {
+        cleanupCallSession({});
+      }
+      const u = selectedUsernameRef.current;
+      if (u) void loadConversationRef.current?.(u, true);
+    });
+
+    socket.on("call:signal:recv", (payload) => {
+      const callId = String(payload?.callId || "");
+      if (!callId || callId !== String(activeCallIdRef.current)) return;
+      const fromId = Number(payload?.fromUserId);
+      if (!fromId) return;
+      void handleIncomingSignal(fromId, payload.signal).catch((err) => {
+        console.error("call:signal:recv", err);
+        toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callNegotiationError"));
+      });
+    });
+
+    socket.on("call:error", (payload) => {
+      const msg = String(payload?.message || "error");
+      if (msg === "peer_offline") {
+        toastApiSocketRef.current?.warning(tSocketRef.current("chatWidget.callPeerOffline"));
+      } else {
+        toastApiSocketRef.current?.error(tSocketRef.current("chatWidget.callErrorGeneric", { msg }));
+      }
+      if (callPhaseRef.current !== "idle") cleanupCallSession({});
+      const u = selectedUsernameRef.current;
+      if (u) void loadConversationRef.current?.(u, true);
+    });
+
     return () => {
+      socket.io.off("reconnect_attempt", syncSocketAuthFromStorage);
       if (reloadConversationsAfterSocketRef.current) {
         clearTimeout(reloadConversationsAfterSocketRef.current);
         reloadConversationsAfterSocketRef.current = null;
       }
+      try {
+        incomingCallRingControlRef.current?.stop?.();
+      } catch (_e) {
+        /* ignore */
+      }
+      try {
+        webRtcCleanupRef.current();
+      } catch (_e) {}
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [currentUser?.username, selectedGroupId, toastApi, mutedDirectUsernames, mutedGroupIds]);
+  }, [currentUser?.username, isPopout]);
 
   useEffect(() => {
     if (!open || chatMode !== "direct" || !selectedUsername) return;
@@ -2066,6 +3074,77 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
   const renderMessageContent = (message) => {
     const raw = message?.isDeleted ? t("chatWidget.messageDeleted") : String(message?.content || "");
     if (!raw) return null;
+    const callLogMarker = "__DNO_CALL_LOG__";
+    if (raw.startsWith(callLogMarker)) {
+      try {
+        const data = JSON.parse(raw.slice(callLogMarker.length));
+        const outcome = String(data?.outcome || "");
+        const isSessionEnd = outcome === "call_ended" || outcome === "call_ended_debug";
+        const reasonKey = `chatWidget.callLogReason_${String(data?.reason || "")}`;
+        let reasonLabel = t(reasonKey);
+        if (reasonLabel === reasonKey) reasonLabel = String(data?.reason || "").trim();
+
+        if (isSessionEnd) {
+          const dur = dnoFormatCallDurationSec(data?.durationSec, t);
+          const byName =
+            String(data?.byDisplayName || "").trim() ||
+            (data?.byUserId != null ? callPeerMetaById.get(Number(data.byUserId))?.label || "" : "") ||
+            "";
+          const parts = [];
+          if (dur) parts.push(t("chatWidget.callLogDurationPart", { duration: dur }));
+          if (byName) parts.push(t("chatWidget.callLogEndedBy", { name: byName }));
+          if (reasonLabel) parts.push(reasonLabel);
+          const line =
+            parts.length > 0 ? parts.join(t("chatWidget.callLogSeparator")) : t("chatWidget.callLogSessionEndedFallback");
+          return (
+            <Box
+              component="span"
+              sx={{
+                display: "block",
+                py: 0.35,
+                px: 0.75,
+                borderRadius: 1.25,
+                bgcolor: message?.isMine ? "rgba(0,0,0,0.14)" : "rgba(37,99,235,0.08)",
+              }}
+            >
+              <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 700, display: "block" }}>
+                {t("chatWidget.callLogBadgeSession")}
+              </Typography>
+              <Typography variant="body2" sx={{ mt: 0.25, lineHeight: 1.45 }}>
+                {line}
+              </Typography>
+            </Box>
+          );
+        }
+
+        const summaryKey = `chatWidget.callMiss_${outcome}`;
+        let summary = t(summaryKey);
+        if (summary === summaryKey) {
+          summary = outcome || t("chatWidget.callMiss_miss_hangup_ringing");
+        }
+        return (
+          <Box
+            component="span"
+            sx={{
+              display: "block",
+              py: 0.35,
+              px: 0.75,
+              borderRadius: 1.25,
+              bgcolor: message?.isMine ? "rgba(0,0,0,0.14)" : "rgba(37,99,235,0.08)",
+            }}
+          >
+            <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 700, display: "block" }}>
+              {t("chatWidget.callMissLogBadge")}
+            </Typography>
+            <Typography variant="body2" sx={{ mt: 0.25, lineHeight: 1.45 }}>
+              {summary}
+            </Typography>
+          </Box>
+        );
+      } catch (_e) {
+        /* fall through to normal render */
+      }
+    }
     const regex = /(@\{[^{}]{1,120}\}|@[^\s@]{3,120})/gu;
     const parts = [];
     let last = 0;
@@ -2338,9 +3417,531 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     closeDeleteConfirmDialog();
   };
 
+  /** Resolves numeric user id for WebRTC signaling (JWT, /me, /chat/session); caches ref + localStorage. */
+  const resolveMyNumericUserIdForCalls = useCallback(async () => {
+    const token = localStorage.getItem("token");
+    if (!token) return 0;
+    const authHeaders = { headers: { Authorization: `Bearer ${token}` } };
+    let myId = chatNumericUserIdRef.current || 0;
+    if (!myId) myId = Number(mergeUserIdFromToken(currentUser ?? {}, token)?.id) || 0;
+    if (!myId) {
+      try {
+        const raw = localStorage.getItem("user");
+        if (raw) myId = Number(JSON.parse(raw).id) || 0;
+      } catch (_e) {}
+    }
+    if (!myId) {
+      try {
+        const { data } = await axios.get(`${API_BASE}/me`, authHeaders);
+        myId = Number(data?.id) || 0;
+        if (!myId) {
+          const merged = mergeUserIdFromToken(data, token);
+          myId = Number(merged?.id) || 0;
+        }
+      } catch (_e) {}
+    }
+    if (!myId) {
+      try {
+        const { data } = await axios.get(`${API_BASE}/chat/session`, authHeaders);
+        myId = Number(data?.id) || 0;
+      } catch (_e) {}
+    }
+    if (myId) {
+      chatNumericUserIdRef.current = myId;
+      try {
+        const raw = localStorage.getItem("user");
+        const prev = raw ? JSON.parse(raw) : {};
+        localStorage.setItem("user", JSON.stringify({ ...prev, id: myId }));
+      } catch (_e) {}
+    }
+    return myId;
+  }, [currentUser]);
+  resolveMyNumericUserIdForCallsRef.current = resolveMyNumericUserIdForCalls;
+
+  const closeCallStartMenu = () => setCallStartAnchorEl(null);
+  const openCallStartMenu = (event) => {
+    event.stopPropagation();
+    setCallStartAnchorEl(event.currentTarget);
+  };
+
+  const startVideoCall = async () => {
+    closeCallStartMenu();
+    if (callPhase !== "idle") return;
+    const token = localStorage.getItem("token");
+    if (!token) {
+      toastApi?.error(t("chatWidget.callMissingUserId"));
+      return;
+    }
+    const myId = await resolveMyNumericUserIdForCalls();
+    if (!myId) {
+      toastApi?.error(t("chatWidget.callMissingUserId"));
+      return;
+    }
+    if (!socketRef.current?.connected) {
+      toastApi?.error(t("chatWidget.callSocketOffline"));
+      return;
+    }
+    const callId = newWebRtcCallId();
+    callMediaPrefsRef.current = { ...callMedia };
+    if (chatMode === "direct") {
+      let tid = Number(selectedUser?.id) || 0;
+      if (!tid && selectedUsername) {
+        try {
+          const { data } = await axios.get(API_BASE + "/chat/users");
+          const list = Array.isArray(data) ? data : [];
+          const row = list.find((u) => chatUsernameKey(u.username) === chatUsernameKey(selectedUsername));
+          tid = Number(row?.id) || 0;
+        } catch (_e) {
+          tid = 0;
+        }
+      }
+      if (!tid) {
+        toastApi?.error(t("chatWidget.callSelectPeer"));
+        return;
+      }
+      setActiveCallMode("direct");
+      setActiveCallId(callId);
+      activeCallIdRef.current = callId;
+      setCallPhase("outgoing");
+      try {
+        const ms =
+          callMedia.audio || callMedia.video
+            ? await navigator.mediaDevices.getUserMedia({
+                audio: callMedia.audio,
+                video: callMedia.video,
+              })
+            : new MediaStream();
+        localStreamRef.current = ms;
+        setMicOn(ms.getAudioTracks().some((tr) => tr.enabled));
+        setCamOn(ms.getVideoTracks().some((tr) => tr.enabled));
+        setLocalPreviewTick((n) => n + 1);
+      } catch (e) {
+        toastGetUserMediaFailure(toastApi, t, e);
+        setCallPhase("idle");
+        setActiveCallId(null);
+        activeCallIdRef.current = null;
+        setActiveCallMode(null);
+        return;
+      }
+      socketRef.current.emit("call:invite", {
+        callId,
+        mode: "direct",
+        targetUserId: tid,
+        media: { audio: callMedia.audio, video: callMedia.video },
+      });
+      return;
+    }
+    const gid = Number(selectedGroupId);
+    if (!gid) {
+      toastApi?.error(t("chatWidget.callSelectGroup"));
+      return;
+    }
+    setActiveCallMode("group");
+    setActiveCallId(callId);
+    activeCallIdRef.current = callId;
+    setCallPhase("outgoing");
+    try {
+      const ms =
+        callMedia.audio || callMedia.video
+          ? await navigator.mediaDevices.getUserMedia({
+              audio: callMedia.audio,
+              video: callMedia.video,
+            })
+          : new MediaStream();
+      localStreamRef.current = ms;
+      setMicOn(ms.getAudioTracks().some((tr) => tr.enabled));
+      setCamOn(ms.getVideoTracks().some((tr) => tr.enabled));
+      setLocalPreviewTick((n) => n + 1);
+    } catch (e) {
+      toastGetUserMediaFailure(toastApi, t, e);
+      setCallPhase("idle");
+      setActiveCallId(null);
+      activeCallIdRef.current = null;
+      setActiveCallMode(null);
+      return;
+    }
+    socketRef.current.emit("call:invite", {
+      callId,
+      mode: "group",
+      groupId: gid,
+      media: { audio: callMedia.audio, video: callMedia.video },
+    });
+  };
+
+  const acceptIncomingCall = async () => {
+    acceptFlowActiveRef.current = true;
+    try {
+    incomingCallRingControlRef.current?.stop?.();
+    const pendingInvite = incomingCallRef.current ?? incomingCall;
+    if (!pendingInvite?.callId) {
+      toastApi?.error(t("chatWidget.callErrorGeneric", { msg: "no_call" }));
+      return;
+    }
+    if (!socketRef.current?.connected) {
+      toastApi?.error(t("chatWidget.callSocketOffline"));
+      return;
+    }
+    unlockAudioIfNeeded();
+    const token = localStorage.getItem("token");
+    if (!token) {
+      toastApi?.error(t("chatWidget.callMissingUserId"));
+      return;
+    }
+    const callId = String(pendingInvite.callId);
+    try {
+      callCoordBcRef.current?.postMessage({
+        type: "dno_call_accept_started",
+        callId,
+        from: callCoordInstanceIdRef.current,
+      });
+    } catch (_e) {
+      /* ignore */
+    }
+    setOpen(true);
+    setCallPhase("connecting");
+    callPhaseRef.current = "connecting";
+    const myId = await resolveMyNumericUserIdForCalls();
+    if (!myId) {
+      toastApi?.error(t("chatWidget.callMissingUserId"));
+      setCallPhase("incoming");
+      callPhaseRef.current = "incoming";
+      return;
+    }
+    callMediaPrefsRef.current = { ...callMedia };
+    activeCallIdRef.current = callId;
+    setActiveCallId(callId);
+    setActiveCallMode(pendingInvite.mode || "direct");
+    try {
+      const ms =
+        callMedia.audio || callMedia.video
+          ? await navigator.mediaDevices.getUserMedia({
+              audio: callMedia.audio,
+              video: callMedia.video,
+            })
+          : new MediaStream();
+      localStreamRef.current = ms;
+      setMicOn(ms.getAudioTracks().some((tr) => tr.enabled));
+      setCamOn(ms.getVideoTracks().some((tr) => tr.enabled));
+      setLocalPreviewTick((n) => n + 1);
+    } catch (e) {
+      toastGetUserMediaFailure(toastApi, t, e);
+      socketRef.current.emit("call:reject", { callId, reason: "media_denied" });
+      setCallPhase("idle");
+      callPhaseRef.current = "idle";
+      setActiveCallId(null);
+      activeCallIdRef.current = null;
+      setActiveCallMode(null);
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+      return;
+    }
+    try {
+      if (!socketRef.current.connected) {
+        toastApi?.error(t("chatWidget.callSocketOffline"));
+        try {
+          localStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+        } catch (_e) {}
+        localStreamRef.current = null;
+        setCallPhase("idle");
+        callPhaseRef.current = "idle";
+        setActiveCallId(null);
+        activeCallIdRef.current = null;
+        setActiveCallMode(null);
+        setIncomingCall(null);
+        incomingCallRef.current = null;
+        return;
+      }
+      socketRef.current.emit("call:accept", { callId });
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+    } catch (err) {
+      console.error(err);
+      toastApi?.error(t("chatWidget.callNegotiationError"));
+      try {
+        localStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+      } catch (_e2) {}
+      localStreamRef.current = null;
+      setCallPhase("idle");
+      callPhaseRef.current = "idle";
+      setActiveCallId(null);
+      activeCallIdRef.current = null;
+      setActiveCallMode(null);
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+    }
+    } finally {
+      acceptFlowActiveRef.current = false;
+    }
+  };
+
+  const rejectIncomingCall = () => {
+    incomingCallRingControlRef.current?.stop?.();
+    let inc = incomingCallRef.current;
+    if (!inc?.callId && incomingCall?.callId) {
+      inc = incomingCall;
+      incomingCallRef.current = inc;
+    }
+    if (!inc?.callId) {
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+      setCallPhase("idle");
+      callPhaseRef.current = "idle";
+      setActiveCallId(null);
+      activeCallIdRef.current = null;
+      return;
+    }
+    if (!socketRef.current?.connected) {
+      toastApi?.error(t("chatWidget.callSocketOffline"));
+      setIncomingCall(null);
+      incomingCallRef.current = null;
+      setCallPhase("idle");
+      setActiveCallId(null);
+      activeCallIdRef.current = null;
+      return;
+    }
+    const callId = String(inc.callId);
+    try {
+      localStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+    } catch (_e) {
+      /* ignore */
+    }
+    localStreamRef.current = null;
+    socketRef.current.emit("call:reject", { callId, reason: "rejected" });
+    setIncomingCall(null);
+    incomingCallRef.current = null;
+    setCallPhase("idle");
+    setActiveCallId(null);
+    activeCallIdRef.current = null;
+  };
+
+  const endActiveCall = () => {
+    const cid = activeCallIdRef.current || activeCallId;
+    if (!cid || !socketRef.current?.connected) {
+      webRtcCleanupRef.current();
+      return;
+    }
+    if (hangupEmittedForCallIdRef.current !== cid) {
+      hangupEmittedForCallIdRef.current = cid;
+      socketRef.current.emit("call:end", { callId: cid, reason: "hangup" });
+    }
+    webRtcCleanupRef.current();
+  };
+
+  const cancelOutgoingCall = () => {
+    const cid = activeCallIdRef.current || activeCallId;
+    if (cid && socketRef.current?.connected && hangupEmittedForCallIdRef.current !== cid) {
+      hangupEmittedForCallIdRef.current = cid;
+      socketRef.current.emit("call:end", { callId: cid, reason: "cancelled" });
+    }
+    webRtcCleanupRef.current();
+  };
+
+  const renegotiateAllPeerConnections = async () => {
+    const cid = activeCallIdRef.current;
+    if (!cid || !socketRef.current?.connected) return;
+    for (const [rid, pc] of peerConnectionsRef.current.entries()) {
+      const remoteUserId = Number(rid);
+      if (!remoteUserId) continue;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await dnoFlushPendingIceOnPc(pc);
+      socketRef.current.emit("call:signal", {
+        callId: cid,
+        toUserId: remoteUserId,
+        signal: { type: "offer", sdp: offer.sdp },
+      });
+    }
+  };
+
+  const toggleCallMic = async () => {
+    const ms = localStreamRef.current;
+    if (!ms) return;
+    let tr = ms.getAudioTracks()[0];
+    if (tr && tr.readyState !== "ended") {
+      if (tr.enabled) {
+        for (const [, pc] of peerConnectionsRef.current.entries()) {
+          const snd = pc.getSenders().find((s) => (s.track && s.track.kind === "audio") || s.__dnoKind === "audio");
+          if (snd) {
+            try {
+              await snd.replaceTrack(null);
+              snd.__dnoKind = "audio";
+            } catch (_e) {
+              /* ignore */
+            }
+          }
+        }
+        try {
+          ms.removeTrack(tr);
+        } catch (_e) {
+          /* ignore */
+        }
+        try {
+          tr.stop();
+        } catch (_e) {
+          /* ignore */
+        }
+        setMicOn(false);
+        callMediaPrefsRef.current = { ...callMediaPrefsRef.current, audio: false };
+        setCallMedia((m) => ({ ...m, audio: false }));
+        setLocalPreviewTick((n) => n + 1);
+        await renegotiateAllPeerConnections();
+        return;
+      }
+      tr.enabled = true;
+      setMicOn(true);
+      callMediaPrefsRef.current = { ...callMediaPrefsRef.current, audio: true };
+      setCallMedia((m) => ({ ...m, audio: true }));
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toastApi?.error(t("chatWidget.callErrorGeneric", { msg: "no_media" }));
+      return;
+    }
+    try {
+      const aStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      tr = aStream.getAudioTracks()[0];
+      if (!tr) {
+        aStream.getTracks().forEach((x) => x.stop());
+        return;
+      }
+      ms.addTrack(tr);
+      tr.enabled = true;
+      setMicOn(true);
+      callMediaPrefsRef.current = { ...callMediaPrefsRef.current, audio: true };
+      setCallMedia((m) => ({ ...m, audio: true }));
+      setLocalPreviewTick((n) => n + 1);
+      const cid = activeCallIdRef.current;
+      if (!cid || !socketRef.current?.connected) return;
+      for (const [rid, pc] of peerConnectionsRef.current.entries()) {
+        const remoteUserId = Number(rid);
+        if (!remoteUserId) continue;
+        const audioSender = pc.getSenders().find((s) => (s.track && s.track.kind === "audio") || (!s.track && s.__dnoKind === "audio"));
+        if (audioSender) {
+          try {
+            await audioSender.replaceTrack(tr);
+            audioSender.__dnoKind = "audio";
+          } catch (_e) {
+            /* ignore */
+          }
+        } else {
+          try {
+            const sender = pc.addTrack(tr, ms);
+            if (sender) sender.__dnoKind = "audio";
+          } catch (_e) {
+            /* ignore */
+          }
+        }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await dnoFlushPendingIceOnPc(pc);
+        socketRef.current.emit("call:signal", {
+          callId: cid,
+          toUserId: remoteUserId,
+          signal: { type: "offer", sdp: offer.sdp },
+        });
+      }
+    } catch (e) {
+      toastGetUserMediaFailure(toastApi, t, e);
+    }
+  };
+
+  const toggleCallCam = async () => {
+    const ms = localStreamRef.current;
+    if (!ms) return;
+    let tr = ms.getVideoTracks()[0];
+    if (tr && tr.readyState !== "ended") {
+      if (tr.enabled) {
+        for (const [, pc] of peerConnectionsRef.current.entries()) {
+          const vs = pc.getSenders().find((s) => (s.track && s.track.kind === "video") || s.__dnoKind === "video");
+          if (vs) {
+            try {
+              await vs.replaceTrack(null);
+              vs.__dnoKind = "video";
+            } catch (_e) {
+              /* ignore */
+            }
+          }
+        }
+        try {
+          ms.removeTrack(tr);
+        } catch (_e) {
+          /* ignore */
+        }
+        try {
+          tr.stop();
+        } catch (_e) {
+          /* ignore */
+        }
+        setCamOn(false);
+        callMediaPrefsRef.current = { ...callMediaPrefsRef.current, video: false };
+        setCallMedia((m) => ({ ...m, video: false }));
+        setLocalPreviewTick((n) => n + 1);
+        await renegotiateAllPeerConnections();
+        return;
+      }
+      tr.enabled = true;
+      setCamOn(true);
+      callMediaPrefsRef.current = { ...callMediaPrefsRef.current, video: true };
+      setCallMedia((m) => ({ ...m, video: true }));
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toastApi?.error(t("chatWidget.callErrorGeneric", { msg: "no_media" }));
+      return;
+    }
+    try {
+      const vStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+      tr = vStream.getVideoTracks()[0];
+      if (!tr) {
+        vStream.getTracks().forEach((x) => x.stop());
+        return;
+      }
+      ms.addTrack(tr);
+      tr.enabled = true;
+      setCamOn(true);
+      callMediaPrefsRef.current = { ...callMediaPrefsRef.current, video: true };
+      setCallMedia((m) => ({ ...m, video: true }));
+      setLocalPreviewTick((n) => n + 1);
+      const cid = activeCallIdRef.current;
+      if (!cid || !socketRef.current?.connected) return;
+      for (const [rid, pc] of peerConnectionsRef.current.entries()) {
+        const remoteUserId = Number(rid);
+        if (!remoteUserId) continue;
+        const videoSender = pc.getSenders().find((s) => (s.track && s.track.kind === "video") || (!s.track && s.__dnoKind === "video"));
+        if (videoSender) {
+          try {
+            await videoSender.replaceTrack(tr);
+            videoSender.__dnoKind = "video";
+          } catch (_e) {
+            /* ignore */
+          }
+        } else {
+          try {
+            const sender = pc.addTrack(tr, ms);
+            if (sender) sender.__dnoKind = "video";
+          } catch (_e) {
+            /* ignore */
+          }
+        }
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await dnoFlushPendingIceOnPc(pc);
+        socketRef.current.emit("call:signal", {
+          callId: cid,
+          toUserId: remoteUserId,
+          signal: { type: "offer", sdp: offer.sdp },
+        });
+      }
+    } catch (e) {
+      toastGetUserMediaFailure(toastApi, t, e);
+    }
+  };
+
   const openDetachedChatWindow = () => {
     try {
-      const url = `${window.location.origin}${window.location.pathname}${window.location.search}#/chat`;
+      const u = String(selectedUsernameRef.current || selectedUsername || "").trim();
+      const qs = u ? `?u=${encodeURIComponent(u)}` : "";
+      const url = `${window.location.origin}${window.location.pathname}${window.location.search}#/chat${qs}`;
       const target = "DigitalNotaryChatPopout";
       const features = ["width=920", "height=780", "resizable=yes", "scrollbars=yes"].join(",");
       const popup = window.open(url, target, features);
@@ -2353,6 +3954,11 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
       } catch (_e) {
         /* ignore */
       }
+      try {
+        localStorage.setItem(DNO_CHAT_POPOUT_ACTIVE_KEY, String(Date.now()));
+      } catch (_e2) {
+        /* ignore */
+      }
       setOpen(false);
     } catch (error) {
       console.error(error);
@@ -2360,8 +3966,271 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
     }
   };
 
+  const toggleCallPanelCompactMode = () => {
+    setCallPanelCompact((cur) => {
+      const next = !cur;
+      if (!next) {
+        const panel = callPanelRef.current;
+        if (panel) {
+          panel.style.width = "";
+          panel.style.height = "";
+        }
+      }
+      return next;
+    });
+  };
+
   return (
     <>
+      <Dialog
+        open={Boolean(incomingCall)}
+        onClose={() => {
+          /* Controlled dialog: no-op. Backdrop/Escape must NOT emit call:reject — mouse users often miss-click the dimmed area thinking it focuses the window. Decline is the only reject path. */
+        }}
+        disableEscapeKeyDown
+        maxWidth="xs"
+        fullWidth
+        slotProps={{
+          root: { sx: { zIndex: 2600 } },
+          /* Never set backdrop z-index above the dialog paper — it blocks all clicks on Answer/Decline while onClose is a no-op. */
+          paper: {
+            sx: { position: "relative", zIndex: 1 },
+            onPointerDown: () => {
+              try {
+                unlockAudioIfNeeded();
+                const c = audioContextRef.current;
+                if (c && c.state !== "running") void c.resume().catch(() => {});
+              } catch (_e) {
+                /* ignore */
+              }
+            },
+          },
+        }}
+      >
+        <DialogTitle sx={{ p: 0 }}>
+          <Box
+            sx={{
+              px: 2,
+              py: 1.5,
+              background: "linear-gradient(125deg, #1d4ed8 0%, #4338ca 52%, #312e81 100%)",
+              color: "#f8fafc",
+            }}
+          >
+            <Stack direction="row" alignItems="center" spacing={1.25}>
+              <Box
+                sx={{
+                  width: 40,
+                  height: 40,
+                  borderRadius: 2,
+                  bgcolor: "rgba(255,255,255,0.16)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  position: "relative",
+                }}
+              >
+                <PhoneIcon sx={{ fontSize: 22 }} />
+                {callPhase !== "connecting" && (
+                  <Box
+                    sx={{
+                      position: "absolute",
+                      inset: -4,
+                      borderRadius: "inherit",
+                      border: "1.5px solid rgba(255,255,255,0.58)",
+                      animation: "dnoIncomingCallPulse 1.4s ease-out infinite",
+                      pointerEvents: "none",
+                      "@keyframes dnoIncomingCallPulse": {
+                        "0%": { transform: "scale(0.92)", opacity: 0.9 },
+                        "70%": { transform: "scale(1.22)", opacity: 0 },
+                        "100%": { transform: "scale(1.22)", opacity: 0 },
+                      },
+                    }}
+                  />
+                )}
+              </Box>
+              {callPhase !== "connecting" && (
+                <Box
+                  sx={{
+                    width: 44,
+                    height: 44,
+                    p: 0.5,
+                    borderRadius: "999px",
+                    flexShrink: 0,
+                    background:
+                      incomingCallerMeta?.hasPresence === true
+                        ? incomingCallerMeta.online
+                          ? "linear-gradient(135deg, #4ade80 0%, #16a34a 100%)"
+                          : "linear-gradient(135deg, #cbd5e1 0%, #64748b 100%)"
+                        : "linear-gradient(135deg, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.2) 100%)",
+                    boxShadow: "0 4px 14px rgba(15,23,42,0.25)",
+                  }}
+                >
+                  <Avatar
+                    src={incomingCallerMeta?.avatarUrl || undefined}
+                    sx={{
+                      width: "100%",
+                      height: "100%",
+                      bgcolor: "rgba(15,23,42,0.35)",
+                      color: "#fff",
+                      fontWeight: 700,
+                      fontSize: "0.95rem",
+                      letterSpacing: 0.4,
+                    }}
+                  >
+                    {dnoAvatarInitials(incomingCallerMeta?.label || incomingCall?.fromUser?.username || "")}
+                  </Avatar>
+                </Box>
+              )}
+              <Box sx={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
+                <Typography variant="subtitle1" sx={{ fontWeight: 800, lineHeight: 1.2 }}>
+                  {callPhase === "connecting" ? t("chatWidget.callConnecting") : t("chatWidget.callIncomingTitle")}
+                </Typography>
+                {callPhase !== "connecting" && (
+                  <>
+                    <Typography variant="caption" sx={{ display: "block", opacity: 0.9, mt: 0.25 }}>
+                      {incomingCall?.fromUser?.username
+                        ? t("chatWidget.callIncomingBody", {
+                            name: String(incomingCallerMeta?.label || incomingCall.fromUser.username || ""),
+                            mode:
+                              incomingCall?.mode === "group"
+                                ? t("chatWidget.callModeGroup")
+                                : t("chatWidget.callModeDirect"),
+                          })
+                        : t("chatWidget.callIncomingTitle")}
+                    </Typography>
+                    {incomingCallerMeta?.hasPresence ? (
+                      <Chip
+                        size="small"
+                        label={getStatusLabel(incomingCallerMeta.status, incomingCallerMeta.online)}
+                        color={getStatusColor(incomingCallerMeta.status, incomingCallerMeta.online)}
+                        sx={{ mt: 0.65, alignSelf: "flex-start", height: 22, fontWeight: 700 }}
+                      />
+                    ) : null}
+                  </>
+                )}
+              </Box>
+            </Stack>
+          </Box>
+        </DialogTitle>
+        <DialogContent sx={{ px: 2, py: 1.5, bgcolor: "#f1f5f9" }}>
+          {callPhase === "connecting" ? (
+            <Typography variant="body2">{t("chatWidget.callConnecting")}</Typography>
+          ) : (
+            <Stack spacing={1}>
+              <Typography variant="caption" color="text.secondary">
+                {t("chatWidget.callIncomingMediaHint")}
+              </Typography>
+              <Paper
+                elevation={0}
+                sx={{
+                  p: 1,
+                  borderRadius: 2,
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  bgcolor: "#fff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                }}
+              >
+                <Stack direction="row" alignItems="center" spacing={1.25}>
+                  <Box
+                    sx={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 2,
+                      bgcolor: "rgba(34,197,94,0.14)",
+                      color: "#166534",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <MicIcon sx={{ fontSize: 21 }} />
+                  </Box>
+                  <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                    {t("chatWidget.callMediaAudio")}
+                  </Typography>
+                </Stack>
+                <Switch
+                  size="small"
+                  checked={callMedia.audio}
+                  onChange={(e) => setCallMedia((m) => ({ ...m, audio: e.target.checked }))}
+                  inputProps={{ "aria-label": t("chatWidget.callMediaAudio") }}
+                />
+              </Paper>
+              <Paper
+                elevation={0}
+                sx={{
+                  p: 1,
+                  borderRadius: 2,
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  bgcolor: "#fff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                }}
+              >
+                <Stack direction="row" alignItems="center" spacing={1.25}>
+                  <Box
+                    sx={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 2,
+                      bgcolor: "rgba(99,102,241,0.14)",
+                      color: "#4338ca",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <VideocamIcon sx={{ fontSize: 21 }} />
+                  </Box>
+                  <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                    {t("chatWidget.callMediaVideo")}
+                  </Typography>
+                </Stack>
+                <Switch
+                  size="small"
+                  checked={callMedia.video}
+                  onChange={(e) => setCallMedia((m) => ({ ...m, video: e.target.checked }))}
+                  inputProps={{ "aria-label": t("chatWidget.callMediaVideo") }}
+                />
+              </Paper>
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 2, pb: 2, pt: 1, bgcolor: "#f1f5f9", gap: 1 }}>
+          <Button
+            type="button"
+            variant="outlined"
+            color="inherit"
+            startIcon={<PhoneDisabledIcon />}
+            sx={{ flex: 1, borderRadius: 2 }}
+            onClick={(e) => {
+              e.stopPropagation();
+              rejectIncomingCall();
+            }}
+          >
+            {t("chatWidget.callReject")}
+          </Button>
+          <Button
+            type="button"
+            variant="contained"
+            startIcon={<PhoneIcon />}
+            disabled={callPhase === "connecting"}
+            autoFocus
+            sx={{ flex: 1, borderRadius: 2, fontWeight: 700, boxShadow: "0 8px 18px rgba(37,99,235,0.35)" }}
+            onClick={(e) => {
+              e.stopPropagation();
+              void acceptIncomingCall();
+            }}
+          >
+            {t("chatWidget.callAccept")}
+          </Button>
+        </DialogActions>
+      </Dialog>
       {!isPopout && !open && (
         <Box
           sx={{
@@ -3075,23 +4944,202 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
                 minWidth: 0,
               }}
             >
-              <ChatTruncationTooltip
-                title={
-                  chatMode === "group"
-                    ? String(selectedGroup?.name || "").trim() || t("chatWidget.selectGroup")
-                    : selectedUser
-                      ? String(selectedUser.fullName || selectedUser.username || "").trim()
-                      : t("chatWidget.selectUser")
-                }
-              >
-                <Typography variant="subtitle2" component="span" sx={{ fontWeight: 800, letterSpacing: 0.15 }}>
-                  {chatMode === "group"
-                    ? selectedGroup?.name || t("chatWidget.selectGroup")
-                    : selectedUser
-                      ? selectedUser.fullName || selectedUser.username
-                      : t("chatWidget.selectUser")}
-                </Typography>
-              </ChatTruncationTooltip>
+              <Box sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 1 }}>
+                <Box sx={{ minWidth: 0, flex: 1 }}>
+                  <ChatTruncationTooltip
+                    title={
+                      chatMode === "group"
+                        ? String(selectedGroup?.name || "").trim() || t("chatWidget.selectGroup")
+                        : selectedUser
+                          ? String(selectedUser.fullName || selectedUser.username || "").trim()
+                          : t("chatWidget.selectUser")
+                    }
+                  >
+                    <Typography variant="subtitle2" component="span" sx={{ fontWeight: 800, letterSpacing: 0.15 }}>
+                      {chatMode === "group"
+                        ? selectedGroup?.name || t("chatWidget.selectGroup")
+                        : selectedUser
+                          ? selectedUser.fullName || selectedUser.username
+                          : t("chatWidget.selectUser")}
+                    </Typography>
+                  </ChatTruncationTooltip>
+                </Box>
+                {((chatMode === "direct" && selectedUser?.id) || (chatMode === "group" && selectedGroupId)) && (
+                  <Tooltip title={t("chatWidget.callStartVideo")} slotProps={{ popper: { sx: CHAT_TOOLTIP_POPPER_SX } }}>
+                    <span>
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        disabled={callPhase !== "idle" || !socketConnected}
+                        onClick={openCallStartMenu}
+                        aria-label={t("chatWidget.callStartVideo")}
+                        sx={{ flexShrink: 0 }}
+                      >
+                        <VideocamIcon fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                )}
+                {((chatMode === "direct" && selectedUser?.id) || (chatMode === "group" && selectedGroupId)) && (
+                  <Menu
+                    anchorEl={callStartAnchorEl}
+                    open={Boolean(callStartAnchorEl)}
+                    onClose={closeCallStartMenu}
+                    anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+                    transformOrigin={{ vertical: "top", horizontal: "right" }}
+                    sx={{ zIndex: 2602 }}
+                    slotProps={{
+                      root: { sx: { zIndex: 2602 } },
+                      paper: {
+                        sx: {
+                          zIndex: 2602,
+                          p: 0,
+                          mt: 1,
+                          minWidth: 292,
+                          maxWidth: 320,
+                          borderRadius: 2.5,
+                          overflow: "hidden",
+                          border: "1px solid rgba(148,163,184,0.28)",
+                          boxShadow: "0 18px 48px rgba(15,23,42,0.16)",
+                        },
+                      },
+                    }}
+                  >
+                    <Box
+                      sx={{
+                        px: 2,
+                        py: 1.35,
+                        background: "linear-gradient(125deg, #1d4ed8 0%, #4338ca 52%, #312e81 100%)",
+                        color: "#f8fafc",
+                      }}
+                    >
+                      <Stack direction="row" alignItems="center" spacing={1.25}>
+                        <Box
+                          sx={{
+                            width: 40,
+                            height: 40,
+                            borderRadius: 2,
+                            bgcolor: "rgba(255,255,255,0.16)",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                          }}
+                        >
+                          <PhoneIcon sx={{ fontSize: 22 }} />
+                        </Box>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="subtitle2" sx={{ fontWeight: 800, letterSpacing: 0.02, lineHeight: 1.25 }}>
+                            {t("chatWidget.callStartVideo")}
+                          </Typography>
+                        </Box>
+                      </Stack>
+                    </Box>
+                    <Box sx={{ px: 1.5, py: 1.25, bgcolor: "#f1f5f9" }}>
+                      <Stack spacing={1}>
+                        <Paper
+                          elevation={0}
+                          sx={{
+                            p: 1,
+                            borderRadius: 2,
+                            border: "1px solid rgba(148,163,184,0.35)",
+                            bgcolor: "#fff",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 1,
+                          }}
+                        >
+                          <Stack direction="row" alignItems="center" spacing={1.25} sx={{ minWidth: 0 }}>
+                            <Box
+                              sx={{
+                                width: 40,
+                                height: 40,
+                                borderRadius: 2,
+                                bgcolor: "rgba(34,197,94,0.14)",
+                                color: "#166534",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                flexShrink: 0,
+                              }}
+                            >
+                              <MicIcon sx={{ fontSize: 22 }} />
+                            </Box>
+                            <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                              {t("chatWidget.callMediaAudio")}
+                            </Typography>
+                          </Stack>
+                          <Switch
+                            size="small"
+                            checked={callMedia.audio}
+                            onChange={(e) => setCallMedia((m) => ({ ...m, audio: e.target.checked }))}
+                            inputProps={{ "aria-label": t("chatWidget.callMediaAudio") }}
+                          />
+                        </Paper>
+                        <Paper
+                          elevation={0}
+                          sx={{
+                            p: 1,
+                            borderRadius: 2,
+                            border: "1px solid rgba(148,163,184,0.35)",
+                            bgcolor: "#fff",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 1,
+                          }}
+                        >
+                          <Stack direction="row" alignItems="center" spacing={1.25} sx={{ minWidth: 0 }}>
+                            <Box
+                              sx={{
+                                width: 40,
+                                height: 40,
+                                borderRadius: 2,
+                                bgcolor: "rgba(99,102,241,0.14)",
+                                color: "#4338ca",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                flexShrink: 0,
+                              }}
+                            >
+                              <VideocamIcon sx={{ fontSize: 22 }} />
+                            </Box>
+                            <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                              {t("chatWidget.callMediaVideo")}
+                            </Typography>
+                          </Stack>
+                          <Switch
+                            size="small"
+                            checked={callMedia.video}
+                            onChange={(e) => setCallMedia((m) => ({ ...m, video: e.target.checked }))}
+                            inputProps={{ "aria-label": t("chatWidget.callMediaVideo") }}
+                          />
+                        </Paper>
+                      </Stack>
+                      <Button
+                        variant="contained"
+                        size="medium"
+                        fullWidth
+                        startIcon={<PhoneIcon />}
+                        sx={{
+                          mt: 1.25,
+                          py: 1,
+                          borderRadius: 2,
+                          fontWeight: 700,
+                          textTransform: "none",
+                          boxShadow: "0 6px 18px rgba(37,99,235,0.32)",
+                        }}
+                        onClick={() => {
+                          void startVideoCall();
+                        }}
+                      >
+                        {t("chatWidget.callStartVideo")}
+                      </Button>
+                    </Box>
+                  </Menu>
+                )}
+              </Box>
               {chatMode === "group" && selectedGroup && (
                 <ChatTruncationTooltip
                   title={(selectedGroup.members || [])
@@ -3160,6 +5208,183 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
             </Box>
 
             <Box sx={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              {(callPhase === "outgoing" || callPhase === "connecting" || callPhase === "inCall") && (
+                <Box
+                  sx={{
+                    position: callPanelCompact ? "fixed" : "absolute",
+                    ...(callPanelCompact
+                      ? {
+                          inset: "auto",
+                          right: 8,
+                          top: 8,
+                          width: { xs: "calc(100% - 16px)", sm: 360 },
+                          maxWidth: "100%",
+                          height: { xs: 220, sm: 260 },
+                          maxHeight: "38vh",
+                          minWidth: 300,
+                          minHeight: 210,
+                        }
+                      : { inset: 0 }),
+                    zIndex: callPanelCompact ? 2601 : 30,
+                    display: "flex",
+                    flexDirection: "column",
+                    bgcolor: "rgba(15,23,42,0.94)",
+                    color: "#f8fafc",
+                    p: 1.5,
+                    gap: 1.25,
+                    overflow: "auto",
+                    borderRadius: callPanelCompact ? 2 : 0,
+                    boxShadow: callPanelCompact ? "0 12px 40px rgba(0,0,0,0.45)" : undefined,
+                    pointerEvents: "auto",
+                  }}
+                  ref={callPanelRef}
+                >
+                  {activeCallMode === "group" && (
+                    <Typography variant="caption" sx={{ color: "rgba(248,250,252,0.75)" }}>
+                      {t("chatWidget.callGroupMeshHint")}
+                    </Typography>
+                  )}
+                  {callPhase === "outgoing" && (
+                    <Typography variant="body2">{t("chatWidget.callOutgoing")}</Typography>
+                  )}
+                  {callPhase === "connecting" && (
+                    <Typography variant="body2">{t("chatWidget.callConnecting")}</Typography>
+                  )}
+                  <Box
+                    sx={{
+                      display: "grid",
+                      gridTemplateColumns: { xs: "1fr", sm: "repeat(auto-fill, minmax(160px, 1fr))" },
+                      gap: 1,
+                      flex: 1,
+                      minHeight: 0,
+                    }}
+                  >
+                    <Box
+                      sx={{
+                        position: "relative",
+                        borderRadius: 1.5,
+                        overflow: "hidden",
+                        bgcolor: "rgba(30,41,59,0.9)",
+                        minHeight: callPanelCompact ? 88 : 120,
+                      }}
+                    >
+                      <video
+                        ref={localVideoRef}
+                        playsInline
+                        muted
+                        autoPlay
+                        style={{ width: "100%", height: "100%", objectFit: "cover", display: camOn ? "block" : "none" }}
+                      />
+                      {!camOn && (
+                        <Box
+                          sx={{
+                            position: "absolute",
+                            inset: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            bgcolor: "rgba(30,41,59,0.95)",
+                            flexDirection: "column",
+                            gap: 0.8,
+                          }}
+                        >
+                          <Avatar
+                            src={currentUser?.avatarUrl || undefined}
+                            sx={{ width: 56, height: 56, bgcolor: "rgba(255,255,255,0.12)", color: "#fff" }}
+                          >
+                            {dnoAvatarInitials(currentUser?.fullName || currentUser?.username || t("chatWidget.callYou"))}
+                          </Avatar>
+                          <VideocamOffIcon sx={{ fontSize: 20, opacity: 0.8 }} />
+                        </Box>
+                      )}
+                      <Typography variant="caption" sx={{ position: "absolute", left: 8, bottom: 6, color: "#fff", textShadow: "0 1px 2px #000" }}>
+                        {t("chatWidget.callYou")}
+                      </Typography>
+                    </Box>
+                    {callRemotePeerIds.map((uid) => (
+                      <Box
+                        key={String(uid)}
+                        sx={{
+                          position: "relative",
+                          borderRadius: 1.5,
+                          overflow: "hidden",
+                          bgcolor: "rgba(30,41,59,0.9)",
+                          minHeight: callPanelCompact ? 88 : 120,
+                        }}
+                      >
+                        <RemoteCallMedia
+                          stream={remoteStreamsByUserId[String(uid)] || null}
+                          avatarUrl={callPeerMetaById.get(uid)?.avatarUrl || ""}
+                          displayName={
+                            callPeerMetaById.get(uid)?.label ||
+                            t("chatWidget.callRemoteFallback", { id: String(uid) })
+                          }
+                        />
+                        <Typography
+                          variant="caption"
+                          sx={{ position: "absolute", left: 8, bottom: 6, color: "#fff", textShadow: "0 1px 2px #000" }}
+                        >
+                          {callPeerMetaById.get(uid)?.label ||
+                            t("chatWidget.callRemoteFallback", { id: String(uid) })}
+                        </Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                  <Stack direction="row" spacing={1} justifyContent="center" alignItems="center" sx={{ pt: 0.5 }}>
+                    {(callPhase === "outgoing" || callPhase === "connecting" || callPhase === "inCall") && (
+                      <>
+                        <IconButton
+                          sx={{ color: "#fff" }}
+                          onClick={() => void toggleCallMic()}
+                          aria-label={t("chatWidget.callToggleMic")}
+                        >
+                          {micOn ? <MicIcon /> : <MicOffIcon />}
+                        </IconButton>
+                        <IconButton
+                          sx={{ color: "#fff" }}
+                          onClick={() => void toggleCallCam()}
+                          aria-label={t("chatWidget.callToggleCam")}
+                        >
+                          {camOn ? <VideocamIcon /> : <VideocamOffIcon />}
+                        </IconButton>
+                        <Tooltip
+                          title={callPanelCompact ? t("chatWidget.callExpandPanel") : t("chatWidget.callCompactPanel")}
+                          slotProps={{ popper: { sx: CHAT_TOOLTIP_POPPER_SX } }}
+                        >
+                          <IconButton
+                            sx={{ color: "#fff" }}
+                            onClick={toggleCallPanelCompactMode}
+                            aria-label={callPanelCompact ? t("chatWidget.callExpandPanel") : t("chatWidget.callCompactPanel")}
+                          >
+                            <PictureInPictureAltIcon />
+                          </IconButton>
+                        </Tooltip>
+                        <Tooltip
+                          title={callPanelCompact ? t("chatWidget.callFullscreen") : t("chatWidget.callExitFullscreen")}
+                          slotProps={{ popper: { sx: CHAT_TOOLTIP_POPPER_SX } }}
+                        >
+                          <IconButton
+                            sx={{ color: "#fff" }}
+                            onClick={() => setCallPanelCompact((v) => !v)}
+                            aria-label={callPanelCompact ? t("chatWidget.callFullscreen") : t("chatWidget.callExitFullscreen")}
+                          >
+                            {callPanelCompact ? <OpenInFullIcon /> : <CloseFullscreenIcon />}
+                          </IconButton>
+                        </Tooltip>
+                      </>
+                    )}
+                    {callPhase === "outgoing" || callPhase === "connecting" ? (
+                      <Button variant="outlined" color="inherit" startIcon={<PhoneDisabledIcon />} onClick={cancelOutgoingCall}>
+                        {t("chatWidget.callCancel")}
+                      </Button>
+                    ) : (
+                      <Button variant="contained" color="error" startIcon={<CallEndIcon />} onClick={endActiveCall}>
+                        {t("chatWidget.callHangUp")}
+                      </Button>
+                    )}
+                  </Stack>
+                </Box>
+              )}
               <Box
                 ref={messageListRef}
                 onScroll={handleMessageListScroll}
@@ -3449,7 +5674,8 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
                           message.isMine &&
                           !message.isDeleted &&
                           Boolean(String(message.content || "").trim()) &&
-                          !message.attachmentName && (
+                          !message.attachmentName &&
+                          !String(message.content || "").startsWith("__DNO_CALL_LOG__") && (
                           <IconButton
                             size="small"
                             onClick={() => handleStartEdit(message)}
@@ -4280,27 +6506,33 @@ export default function DirectChatWidget({ currentUser, toastApi, isPopout = fal
                       noOptionsText={t("chatWidget.noMatchingUsers")}
                       renderOption={(props, option, { selected }) => {
                         const { key, ...optionProps } = props;
+                        const liProps = pickAutocompleteLiProps(optionProps);
                         return (
-                        <Box key={key} component="li" {...optionProps} sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                          <Checkbox
-                            checked={selected}
-                            icon={<CheckBoxOutlineBlankIcon fontSize="small" />}
-                            checkedIcon={<CheckBoxIcon fontSize="small" />}
-                            sx={{ p: 0.25 }}
-                          />
-                          <Avatar src={option.avatarUrl || undefined} sx={{ width: 24, height: 24 }}>
-                            {String(option.fullName || option.username || "U").slice(0, 1).toUpperCase()}
-                          </Avatar>
-                          <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 0 }}>
-                            {option.fullName || option.username}
-                          </Typography>
-                          {existingGroupMemberUsernames.has(String(option.username || "").toLowerCase()) ? (
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: "auto" }}>
-                              ({t("chatWidget.alreadyMember")})
+                          <Box
+                            key={key}
+                            component="li"
+                            {...liProps}
+                            sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, py: 0.5, listStyle: "none" }}
+                          >
+                            <Checkbox
+                              checked={selected}
+                              icon={<CheckBoxOutlineBlankIcon fontSize="small" />}
+                              checkedIcon={<CheckBoxIcon fontSize="small" />}
+                              sx={{ p: 0.25 }}
+                            />
+                            <Avatar src={option.avatarUrl || undefined} sx={{ width: 24, height: 24 }}>
+                              {String(option.fullName || option.username || "U").slice(0, 1).toUpperCase()}
+                            </Avatar>
+                            <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 0 }}>
+                              {option.fullName || option.username}
                             </Typography>
-                          ) : null}
-                        </Box>
-                      );
+                            {existingGroupMemberUsernames.has(String(option.username || "").toLowerCase()) ? (
+                              <Typography variant="caption" color="text.secondary" sx={{ ml: "auto" }}>
+                                ({t("chatWidget.alreadyMember")})
+                              </Typography>
+                            ) : null}
+                          </Box>
+                        );
                       }}
                       renderInput={(params) => {
                         const safeInputProps = params?.InputProps || {};

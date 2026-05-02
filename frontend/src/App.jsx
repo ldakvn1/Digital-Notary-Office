@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { API_BASE } from "./apiBase";
+import { syncAxiosAuthFromStorage } from "./axiosAuthBootstrap";
+import { mergeUserIdFromToken } from "./authToken";
 import axios from "axios";
 import {
   Button,
@@ -137,7 +139,13 @@ export default function App() {
   );
   const [user, setUser] = useState(() => {
     const stored = localStorage.getItem("user");
-    return stored ? JSON.parse(stored) : null;
+    const token = localStorage.getItem("token");
+    if (!stored) return null;
+    try {
+      return mergeUserIdFromToken(JSON.parse(stored), token);
+    } catch {
+      return null;
+    }
   });
   const [view, setView] = useState(() => {
     const stored = localStorage.getItem("user");
@@ -325,17 +333,15 @@ export default function App() {
   }, [view, isLoggedIn]);
 
   useEffect(() => {
-    const token = localStorage.getItem("token");
-    if (token) {
-      applyAccessToken(token);
-    }
+    syncAxiosAuthFromStorage();
   }, []);
   useEffect(() => {
     if (!isLoggedIn) return;
     const syncCurrentUser = async () => {
       try {
         const res = await axios.get(API_BASE + "/me");
-        const nextUser = res?.data || null;
+        const token = localStorage.getItem("token");
+        const nextUser = mergeUserIdFromToken(res?.data || null, token);
         if (!nextUser) return;
         setUser(nextUser);
         localStorage.setItem("user", JSON.stringify(nextUser));
@@ -424,6 +430,23 @@ export default function App() {
             localStorage.setItem("token", newAccessToken);
             localStorage.setItem("refreshToken", newRefreshToken);
             applyAccessToken(newAccessToken);
+            const refreshedUser = refreshRes.data?.user;
+            if (refreshedUser) {
+              const merged = mergeUserIdFromToken(refreshedUser, newAccessToken);
+              localStorage.setItem("user", JSON.stringify(merged));
+              setUser(merged);
+            } else {
+              try {
+                const raw = localStorage.getItem("user");
+                if (raw) {
+                  const merged = mergeUserIdFromToken(JSON.parse(raw), newAccessToken);
+                  localStorage.setItem("user", JSON.stringify(merged));
+                  setUser(merged);
+                }
+              } catch (_e) {
+                /* ignore */
+              }
+            }
             originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
             return axios(originalRequest);
           } catch (refreshError) {
@@ -585,13 +608,14 @@ export default function App() {
   };
 
   const handleLogin = (userData, tokens) => {
+    const merged = mergeUserIdFromToken(userData, tokens.accessToken);
     localStorage.setItem("token", tokens.accessToken);
     localStorage.setItem("refreshToken", tokens.refreshToken);
-    localStorage.setItem("user", JSON.stringify(userData));
+    localStorage.setItem("user", JSON.stringify(merged));
     applyAccessToken(tokens.accessToken);
-    setUser(userData);
+    setUser(merged);
     setIsLoggedIn(true);
-    setView(getDefaultViewByRole(userData?.role));
+    setView(getDefaultViewByRole(merged?.role));
   };
 
 
@@ -1048,6 +1072,7 @@ export default function App() {
     localStorage.removeItem("user");
     localStorage.removeItem("app_view");
     applyAccessToken(null);
+    syncAxiosAuthFromStorage();
     setIsLoggedIn(false);
     setUser(null);
   };
@@ -2679,8 +2704,9 @@ export default function App() {
           <ProfileManagement
             user={user}
             onUserUpdated={(nextUser) => {
-              setUser(nextUser);
-              localStorage.setItem("user", JSON.stringify(nextUser));
+              const merged = mergeUserIdFromToken(nextUser, localStorage.getItem("token"));
+              setUser(merged);
+              localStorage.setItem("user", JSON.stringify(merged));
             }}
             onRequireRelogin={logout}
           />
@@ -2795,7 +2821,11 @@ export default function App() {
           </Button>
         </DialogActions>
       </Dialog>
-      <DirectChatWidget currentUser={user} toastApi={toastApi} />
+      <DirectChatWidget
+        currentUser={user}
+        toastApi={toastApi}
+        defaultCallVideoEnabled={import.meta.env.PROD}
+      />
       <ToastHost toast={toast} onClose={closeToast} />
     </Box>
   );
