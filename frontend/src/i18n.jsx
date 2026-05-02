@@ -851,7 +851,7 @@ const dictionaries = {
       chat: "💬 Internal Chat",
       users: "👤 User Management",
       profile: "My Profile",
-      templates: "📝 Templates",
+      templates: "📝 Template management",
       translators: "🌐 Translator Collaborators",
     },
     chat: {
