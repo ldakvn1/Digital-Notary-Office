@@ -1,0 +1,20 @@
+﻿node_modules/
+dist/
+build/
+.next/
+.output/
+__pycache__/
+coverage/
+public/assets/
+static/media/
+
+# Monorepo/nested packages
+**/node_modules/
+**/dist/
+**/build/
+**/.next/
+**/.output/
+**/__pycache__/
+**/coverage/
+**/public/assets/
+**/static/media/

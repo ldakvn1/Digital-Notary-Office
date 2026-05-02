@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-label="Digital Notary Office">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+  </defs>
+  <rect x="20" y="20" width="200" height="200" rx="40" fill="#0b1220"/>
+  <rect x="52" y="52" width="136" height="136" rx="24" fill="url(#g)"/>
+  <path d="M86 120h68v12H86zm0 24h52v12H86zm0-48h68v12H86z" fill="#e2e8f0"/>
+  <circle cx="162" cy="160" r="20" fill="#22c55e"/>
+  <path d="M154 160l6 6 10-12" fill="none" stroke="#f8fafc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,24 @@
+﻿{
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.next": true,
+    "**/.output": true,
+    "**/__pycache__": true,
+    "**/coverage": true,
+    "**/public/assets": true,
+    "**/static/media": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.next/**": true,
+    "**/.output/**": true,
+    "**/__pycache__/**": true,
+    "**/coverage/**": true,
+    "**/public/assets/**": true,
+    "**/static/media/**": true
+  }
+}

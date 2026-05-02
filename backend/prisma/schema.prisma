@@ -1,0 +1,391 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id            Int            @id @default(autoincrement())
+  username      String         @unique
+  password      String
+  mustChangePassword Boolean   @default(false)
+  initialPasswordExpiresAt DateTime?
+  isActive      Boolean        @default(true)
+  role          String
+  fullName      String?
+  email         String?
+  phone         String?
+  avatarUrl     String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  notifications Notification[]
+  sessions      Session[]
+  resetTokens   PasswordResetToken[]
+  chatMessages  InternalChatMessage[]
+  directMessagesSent     DirectMessage[] @relation("DirectMessagesSent")
+  directMessagesReceived DirectMessage[] @relation("DirectMessagesReceived")
+  chatPresence           ChatPresence?
+  groupChatsOwned        GroupChat[]      @relation("GroupChatOwner")
+  groupChatMemberships   GroupChatMember[]
+  groupChatMessages      GroupChatMessage[]
+  groupMentions          GroupChatMention[]
+  directMessageReactions DirectMessageReaction[]
+  groupMessageReactions  GroupChatMessageReaction[]
+}
+
+model Customer {
+  id          Int      @id @default(autoincrement())
+  customerId  String   @unique
+  fullName    String
+  phone       String
+  email       String?
+  idNumber    String?
+  gender      String?
+  dateOfBirth DateTime?
+  address     String?
+  notes       String?
+  totalCases  Int      @default(0)
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  cases       Case[]
+}
+
+model Case {
+  id                 Int        @id @default(autoincrement())
+  caseId             String     @unique
+  customerId         Int?
+  customer           Customer?  @relation(fields: [customerId], references: [id])
+  customerName       String
+  phone              String
+  type               String
+  caseCategory       String     @default("CONTRACT")
+  authorizationKind  String?
+  certificationKind  String?
+  inheritancePostingStartedAt DateTime?
+  inheritancePostingEndsAt    DateTime?
+  inheritancePostingResult    String?
+  inheritancePostingNotes     String?
+  archivalRetentionUntil      DateTime?
+  description        String?
+  notes              String?
+  status             String
+  assignedTo         String?
+  deadline           DateTime?
+  priority           String?    @default("normal")
+  notaryBookNumber   String?
+  notaryRecordNumber Int?
+  issuedAt           DateTime?
+  isLocked           Boolean    @default(false)
+  feeAmount          Float      @default(0)
+  feePaid            Float      @default(0)
+  feeReceiptNo       String?
+  paymentMethod      String?    @default("CASH")
+  draftedBy          String?
+  reviewedBy         String?
+  signedAt           DateTime?
+  sealedAt           DateTime?
+  releasedAt         DateTime?
+  releaseCode        String?
+  signatureStatus    String     @default("PENDING")
+  signedFileId       Int?
+  signerName         String?
+  certificateSerial  String?
+  signatureProvider  String?
+  signatureCheckedAt DateTime?
+  publicTrackingCode String?    @unique
+  publicTrackingEnabled Boolean @default(false)
+  isDeleted          Boolean    @default(false)
+  deletedAt          DateTime?
+  deletedBy          String?
+  deleteReason       String?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+  files              File[]
+  history            AuditLog[]
+  copyRequests       CopyIssuanceRequest[]
+  receipts           Receipt[]
+}
+
+model Receipt {
+  id            Int      @id @default(autoincrement())
+  receiptNo     String   @unique
+  case          Case     @relation(fields: [caseId], references: [id])
+  caseId        Int
+  amount        Float
+  paymentMethod String   @default("CASH")
+  collectedAt   DateTime @default(now())
+  collectedBy   String
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model File {
+  id         Int      @id @default(autoincrement())
+  case       Case     @relation(fields: [caseId], references: [id])
+  caseId     Int
+  filename   String
+  url        String
+  fileType   String
+  uploadedAt DateTime @default(now())
+  uploadedBy String
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  caseId    Int?
+  message   String
+  type      String
+  status    String   @default("unread")
+  createdAt DateTime @default(now())
+  actionUrl String?
+}
+
+model InternalChatMessage {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  content   String
+  createdAt DateTime @default(now())
+}
+
+model DirectMessage {
+  id         Int      @id @default(autoincrement())
+  sender     User     @relation("DirectMessagesSent", fields: [senderId], references: [id])
+  senderId   Int
+  receiver   User     @relation("DirectMessagesReceived", fields: [receiverId], references: [id])
+  receiverId Int
+  content    String
+  senderHidden Boolean @default(false)
+  receiverHidden Boolean @default(false)
+  attachmentUrl  String?
+  attachmentName String?
+  attachmentMime String?
+  attachmentSize Int?
+  replyToMessageId Int?
+  replyToSender    String?
+  replyToSnippet   String?
+  createdAt  DateTime @default(now())
+  deliveredAt DateTime?
+  readAt     DateTime?
+  editedAt   DateTime?
+  isDeleted  Boolean  @default(false)
+  deletedAt  DateTime?
+  reactions  DirectMessageReaction[]
+}
+
+model ChatPresence {
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int      @id
+  lastSeenAt DateTime @default(now())
+  status    String   @default("AVAILABLE")
+}
+
+model GroupChat {
+  id          Int               @id @default(autoincrement())
+  name        String
+  owner       User              @relation("GroupChatOwner", fields: [ownerId], references: [id])
+  ownerId     Int
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  members     GroupChatMember[]
+  messages    GroupChatMessage[]
+}
+
+model GroupChatMember {
+  id          Int       @id @default(autoincrement())
+  group       GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  groupId     Int
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      Int
+  isAdmin     Boolean   @default(false)
+  joinedAt    DateTime  @default(now())
+  lastReadAt  DateTime?
+
+  @@unique([groupId, userId])
+}
+
+model GroupChatMessage {
+  id          Int                @id @default(autoincrement())
+  group       GroupChat          @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  groupId     Int
+  sender      User               @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  senderId    Int
+  content     String
+  attachmentUrl  String?
+  attachmentName String?
+  attachmentMime String?
+  attachmentSize Int?
+  replyToMessageId Int?
+  replyToSender    String?
+  replyToSnippet   String?
+  createdAt   DateTime           @default(now())
+  editedAt    DateTime?
+  isDeleted   Boolean            @default(false)
+  deletedAt   DateTime?
+  mentions    GroupChatMention[]
+  reactions   GroupChatMessageReaction[]
+}
+
+model DirectMessageReaction {
+  id        Int           @id @default(autoincrement())
+  message   DirectMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId Int
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  emoji     String
+  createdAt DateTime      @default(now())
+
+  @@unique([messageId, userId, emoji])
+}
+
+model GroupChatMessageReaction {
+  id        Int              @id @default(autoincrement())
+  message   GroupChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId Int
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  emoji     String
+  createdAt DateTime         @default(now())
+
+  @@unique([messageId, userId, emoji])
+}
+
+model GroupChatMention {
+  id          Int              @id @default(autoincrement())
+  message     GroupChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId   Int
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      Int
+  username    String
+
+  @@unique([messageId, userId])
+}
+
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  case       Case?    @relation(fields: [caseId], references: [id])
+  caseId     Int?
+  action     String
+  fromStatus String?
+  toStatus   String?
+  notes      String?
+  timestamp  DateTime @default(now())
+  user       String
+  details    String?
+}
+
+model DocumentTemplate {
+  id          Int      @id @default(autoincrement())
+  name        String
+  code        String   @unique
+  category    String
+  content     String
+  sourceDocxPath String?
+  sourceDocxName String?
+  useSourceDocx Boolean @default(false)
+  version     Int      @default(1)
+  isActive    Boolean  @default(false)
+  status      String   @default("DRAFT")
+  createdBy   String
+  reviewedBy  String?
+  approvedBy  String?
+  submittedAt DateTime?
+  reviewedAt  DateTime?
+  approvedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  versions    DocumentTemplateVersion[]
+}
+
+model DocumentTemplateVersion {
+  id         Int      @id @default(autoincrement())
+  template   DocumentTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  templateId Int
+  version    Int
+  name       String
+  category   String
+  content    String
+  sourceDocxPath String?
+  sourceDocxName String?
+  useSourceDocx Boolean @default(false)
+  status     String
+  changedBy  String
+  changedAt  DateTime @default(now())
+
+  @@unique([templateId, version])
+}
+
+model Session {
+  id               Int       @id @default(autoincrement())
+  sessionId        String    @unique
+  user             User      @relation(fields: [userId], references: [id])
+  userId           Int
+  refreshTokenHash String
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+}
+
+model PasswordResetToken {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+model LoginAttempt {
+  id             Int      @id @default(autoincrement())
+  key            String   @unique
+  failCount      Int      @default(0)
+  firstAttemptAt DateTime @default(now())
+  lastAttemptAt  DateTime @default(now())
+  lockUntil      DateTime?
+  lockLevel      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model TranslatorCollaborator {
+  id              Int      @id @default(autoincrement())
+  fullName        String
+  idNumber        String?
+  languages       String?
+  signatureSample String?
+  isActive        Boolean  @default(true)
+  createdBy       String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model CopyIssuanceRequest {
+  id                Int       @id @default(autoincrement())
+  case              Case      @relation(fields: [caseId], references: [id])
+  caseId            Int
+  requesterName     String
+  requesterIdNumber String?
+  requesterRelation String
+  legalBasis        String?
+  status            String    @default("PENDING")
+  decidedBy         String?
+  decidedAt         DateTime?
+  rejectionReason   String?
+  issuedAt          DateTime?
+  notes             String?
+  createdBy         String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
